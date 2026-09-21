@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=RePlay-mod
+Name=replay-rs
 GenericName=Replay Buffer
 Comment=Постоянная запись экрана с сохранением последних N секунд
-Exec=RePlay-mod
+Exec=replay-rs
 Icon=media-record
 Terminal=false
 Categories=AudioVideo;Recorder;
-StartupWMClass=RePlay-mod
+StartupWMClass=replay-rs
 X-KDE-StartupNotify=false
