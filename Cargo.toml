@@ -1,0 +1,29 @@
+[package]
+name = "replay-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Replay buffer screen recorder for Wayland/KDE (ShadowPlay-style)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts", "screencast"] }
+async-io = "2.6.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.7", features = ["derive"] }
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+egui_extras = { version = "0.36.2", features = ["file", "image"] }
+env_logger = "0.11.11"
+futures-util = { version = "0.3.34", default-features = false }
+gstreamer = "0.25.3"
+gstreamer-app = "0.25.2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
+libc = "0.2.189"
+log = "0.4.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+signal-hook = "0.4.4"
+
+[profile.release]
+opt-level = 2
