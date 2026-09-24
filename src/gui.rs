@@ -232,9 +232,22 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    /// Всё окно. Вынесено из `eframe::App::ui`, чтобы раскладку можно было
+    /// проверять в тестах без настоящего окна и `eframe::Frame`.
+    fn draw(&mut self, ui: &mut egui::Ui) {
         self.drain_messages();
         self.rescan_if_stale();
+        #[cfg(target_os = "linux")]
         self.minimize_instead_of_closing(ui.ctx());
+        #[cfg(windows)]
+        if self.shortcuts.should_quit() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Статус буфера живой, поэтому перерисовываемся по таймеру.
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(TICK);
@@ -242,9 +255,11 @@ impl eframe::App for App {
         egui::Panel::top("status")
             .frame(egui::Frame::new().fill(SURFACE).inner_margin(20))
             .show(ui, |ui| self.status_bar(ui));
+        // Ширина фиксирована: несжимаемая панель egui подстраивается под самую
+        // широкую строку содержимого. Длинная ошибка портала в ряду хоткея
+        // раздувала её на всё окно, и библиотеку сжимало в узкую полосу.
         egui::Panel::left("settings")
-            .resizable(false)
-            .default_size(310.0)
+            .exact_size(SETTINGS_WIDTH)
             .frame(egui::Frame::new().fill(SURFACE).inner_margin(18))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -266,6 +281,7 @@ impl App {
     /// поднять его заново нельзя. Свёрнутое остаётся в панели задач, откуда
     /// пользователь его и разворачивает. Запись при этом идёт, выход — через
     /// меню в трее или `replay-rs --quit`.
+    #[cfg(target_os = "linux")]
     fn minimize_instead_of_closing(&self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -299,7 +315,14 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             let (label, color) = match self.service.state() {
                 CaptureState::Running => ("● Запись идёт", ACCENT),
-                CaptureState::WaitingForPortal => ("● Выберите экран", WARNING),
+                CaptureState::WaitingForPortal => (
+                    if cfg!(windows) {
+                        "● Запуск захвата"
+                    } else {
+                        "● Выберите экран"
+                    },
+                    WARNING,
+                ),
                 CaptureState::Stopped => ("● Остановлено", MUTED),
                 CaptureState::Failed(_) => ("● Ошибка записи", DANGER),
             };
@@ -311,15 +334,13 @@ impl App {
                 0.0
             };
             ui.add(
+                // Без текста внутри: светлые цифры поверх бирюзовой заливки
+                // не читались, заполненная часть их съедала.
                 egui::ProgressBar::new(fill as f32)
                     .fill(ACCENT)
-                    .desired_width(180.0)
-                    .text(format!(
-                        "Буфер  {:.1} / {:.0} с",
-                        stats.seconds(),
-                        cfg.seconds
-                    )),
+                    .desired_width(180.0),
             );
+            ui.label(format!("{:.1} / {:.0} с", stats.seconds(), cfg.seconds));
             ui.separator();
             ui.weak(format!(
                 "{:.1} / {} МиБ",
@@ -374,6 +395,11 @@ impl App {
                 .small()
                 .weak(),
         );
+        #[cfg(windows)]
+        {
+            ui.label("Монитор (-1 — основной)");
+            ui.add(egui::DragValue::new(&mut self.draft.monitor).range(-1..=64));
+        }
         ui.label("Битрейт");
         ui.add(egui::Slider::new(&mut self.draft.bitrate, 1000..=100_000).suffix(" кбит/с"));
         ui.label("Кадров в секунду");
@@ -412,7 +438,11 @@ impl App {
                 {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 180, 80),
-                        "AAC недоступен — поставьте gst-libav",
+                        if cfg!(windows) {
+                            "AAC недоступен — установите GStreamer Complete"
+                        } else {
+                            "AAC недоступен — поставьте gst-libav"
+                        },
                     );
                 }
                 ui.checkbox(&mut self.draft.audio.system, "Системный звук");
@@ -437,9 +467,13 @@ impl App {
                     "кодировщика звука нет",
                 );
                 ui.label(
-                    egui::RichText::new("поставьте gst-libav (AAC) — opusenc тоже подойдёт")
-                        .small()
-                        .weak(),
+                    egui::RichText::new(if cfg!(windows) {
+                        "Установите GStreamer Complete с AAC или Opus"
+                    } else {
+                        "поставьте gst-libav (AAC) — opusenc тоже подойдёт"
+                    })
+                    .small()
+                    .weak(),
                 );
             }
         }
@@ -456,9 +490,7 @@ impl App {
             self.draft.output = PathBuf::from(dir);
         }
         if ui.button("Открыть папку").clicked() {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&self.draft.output)
-                .spawn();
+            let _ = crate::platform::open_path(&self.draft.output);
         }
 
         ui.add_space(12.0);
@@ -494,30 +526,67 @@ impl App {
     fn shortcut_section(&mut self, ui: &mut egui::Ui) {
         let st = self.shortcuts.state();
         ui.label(egui::RichText::new("Хоткей сохранения").strong());
-        ui.horizontal(|ui| {
-            ui.label("комбинация:");
-            let text = st.summary();
-            if st.error.is_some() {
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 100), text);
-            } else if st.trigger.is_some() {
-                ui.colored_label(egui::Color32::from_rgb(140, 190, 140), text);
-            } else {
-                ui.colored_label(egui::Color32::from_rgb(220, 180, 80), text);
+        // Отдельной строкой и с переносом: в горизонтальном ряду текст не
+        // переносится, и полный текст ошибки D-Bus растягивал всю панель.
+        match &st.error {
+            Some(err) => {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("портал хоткеев недоступен")
+                            .color(egui::Color32::from_rgb(220, 140, 100)),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text(err);
+                if err.contains("app id") {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "Запустите replay-rs из меню приложений: при запуске \
+                                 из файлового менеджера портал не знает, чей это хоткей.",
+                            )
+                            .small()
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                }
             }
-        });
+            None => {
+                let color = if st.trigger.is_some() {
+                    egui::Color32::from_rgb(140, 190, 140)
+                } else {
+                    egui::Color32::from_rgb(220, 180, 80)
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("комбинация: {}", st.summary())).color(color),
+                    )
+                    .wrap(),
+                );
+            }
+        }
 
         if ui
             .add_enabled(
                 st.error.is_none(),
-                egui::Button::new("Настроить комбинацию…"),
+                egui::Button::new(if cfg!(windows) {
+                    "О сочетании клавиш…"
+                } else {
+                    "Настроить комбинацию…"
+                }),
             )
-            .on_hover_text("Откроет системный редактор KDE для действий replay-rs")
+            .on_hover_text(if cfg!(windows) {
+                "Информация о Ctrl+Alt+S"
+            } else {
+                "Откроет системный редактор KDE для действий replay-rs"
+            })
             .clicked()
         {
             self.shortcuts.open_settings();
         }
 
-        if st.trigger.is_none() && st.registered {
+        if cfg!(target_os = "linux") && st.trigger.is_none() && st.registered {
             ui.label(
                 egui::RichText::new(
                     "Клавишу назначает композитор — нажмите «Настроить комбинацию…»",
@@ -545,20 +614,37 @@ impl App {
     }
 
     fn clips_panel(&mut self, ui: &mut egui::Ui) {
+        // На узкой панели кнопки уходят на свою строку: right_to_left в
+        // горизонтальном ряду не переносится и рисует их поверх заголовка.
+        let narrow = ui.available_width() < 380.0;
+        let mut refresh = false;
+        let mut open_folder = false;
+        let buttons = |ui: &mut egui::Ui, refresh: &mut bool, open_folder: &mut bool| {
+            if ui.button("Обновить").clicked() {
+                *refresh = true;
+            }
+            if ui.button("Папка").clicked() {
+                *open_folder = true;
+            }
+        };
         ui.horizontal(|ui| {
             ui.heading("Библиотека");
-            ui.weak(format!("{} клипов", self.clips.len()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Обновить").clicked() {
-                    self.refresh_clips();
-                }
-                if ui.button("Папка").clicked() {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(&self.rec.config().output)
-                        .spawn();
-                }
-            });
+            ui.weak(clips_count(self.clips.len()));
+            if !narrow {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    buttons(ui, &mut refresh, &mut open_folder)
+                });
+            }
         });
+        if narrow {
+            ui.horizontal(|ui| buttons(ui, &mut refresh, &mut open_folder));
+        }
+        if refresh {
+            self.refresh_clips();
+        }
+        if open_folder {
+            let _ = crate::platform::open_path(&self.rec.config().output);
+        }
         ui.weak("Последние сохранённые моменты · новые сверху");
         ui.add_space(18.0);
 
@@ -586,65 +672,7 @@ impl App {
             .id_salt("clips_scroll")
             .show(ui, |ui| {
                 for clip in &self.clips {
-                    card().show(ui, |ui| {
-                        ui.set_min_width((ui.available_width() - 2.0).max(0.0));
-                        // На узком окне метаданные переходят под превью.
-                        let compact = ui.available_width() < 460.0;
-                        let layout = if compact {
-                            egui::Layout::top_down(egui::Align::Min)
-                        } else {
-                            egui::Layout::left_to_right(egui::Align::Center)
-                        };
-                        ui.with_layout(layout, |ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size([160.0, 90.0].into(), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 8.0, BACKGROUND);
-                            if let Some(t) = &clip.thumb {
-                                ui.put(
-                                    rect,
-                                    egui::Image::new(format!("file://{}", t.display()))
-                                        .max_size([160.0, 90.0].into())
-                                        .corner_radius(8.0),
-                                );
-                            } else {
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "Нет превью",
-                                    egui::FontId::proportional(13.0),
-                                    MUTED,
-                                );
-                            }
-                            ui.vertical(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(file_name(&clip.path)).strong(),
-                                    )
-                                    .wrap(),
-                                );
-                                let date: chrono::DateTime<chrono::Local> = clip.modified.into();
-                                ui.weak(format!(
-                                    "{} · {:.1} МБ · MP4",
-                                    date.format("%d.%m.%Y  %H:%M"),
-                                    clip.size as f64 / 1e6
-                                ));
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Открыть клип").clicked() {
-                                        let _ = std::process::Command::new("xdg-open")
-                                            .arg(&clip.path)
-                                            .spawn();
-                                    }
-                                    if ui
-                                        .button(egui::RichText::new("Удалить").color(DANGER))
-                                        .clicked()
-                                    {
-                                        delete_request = Some(clip.path.clone());
-                                    }
-                                });
-                            });
-                        });
-                    });
+                    clip_row(ui, clip, &mut delete_request);
                     ui.add_space(10.0);
                 }
             });
@@ -686,6 +714,100 @@ impl App {
             self.pending_delete = None;
         }
     }
+}
+
+/// Ширина панели настроек.
+const SETTINGS_WIDTH: f32 = 310.0;
+
+/// Высота превью в списке клипов; ширина — под 16:9.
+const THUMB_SIZE: egui::Vec2 = egui::vec2(160.0, 90.0);
+
+/// Карточка одного клипа: превью, имя, метаданные, кнопки.
+fn clip_row(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option<PathBuf>) -> egui::Rect {
+    let rect = card().show(ui, |ui| {
+        ui.set_min_width((ui.available_width() - 2.0).max(0.0));
+        // На узком окне метаданные переходят под превью.
+        let compact = ui.available_width() < 460.0;
+        if compact {
+            ui.vertical(|ui| clip_row_contents(ui, clip, delete_request));
+        } else {
+            // Высоту ряда ограничиваем высотой превью. with_layout с
+            // горизонтальной раскладкой внутри вертикальной панели забирает
+            // всю оставшуюся высоту: карточка раздувалась на всё окно, а
+            // превью центрировалось посреди этой пустоты, далеко под текстом.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), THUMB_SIZE.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| clip_row_contents(ui, clip, delete_request),
+            );
+        }
+    })
+    .response
+    .rect;
+    ui.add_space(10.0);
+    rect
+}
+
+fn clip_row_contents(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option<PathBuf>) {
+    // На узкой карточке превью сжимается под её ширину с сохранением 16:9:
+    // превью фиксированной ширины само вылезало за правый край.
+    let thumb = if ui.available_width() < THUMB_SIZE.x {
+        let w = ui.available_width().max(1.0);
+        egui::vec2(w, w * THUMB_SIZE.y / THUMB_SIZE.x)
+    } else {
+        THUMB_SIZE
+    };
+    let (rect, _) = ui.allocate_exact_size(thumb, egui::Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, BACKGROUND);
+    if let Some(t) = &clip.thumb {
+        ui.put(
+            rect,
+            egui::Image::new(crate::platform::file_uri(t))
+                .max_size(thumb)
+                .corner_radius(8.0),
+        );
+    } else {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Нет превью",
+            egui::FontId::proportional(13.0),
+            MUTED,
+        );
+    }
+    ui.vertical(|ui| {
+        ui.add(egui::Label::new(egui::RichText::new(file_name(&clip.path)).strong()).wrap());
+        let date: chrono::DateTime<chrono::Local> = clip.modified.into();
+        ui.weak(format!(
+            "{} · {:.1} МБ · MP4",
+            date.format("%d.%m.%Y  %H:%M"),
+            clip.size as f64 / 1e6
+        ));
+        ui.add_space(6.0);
+        // С переносом: на узкой карточке «Удалить» вылезал за правый край.
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Открыть клип").clicked() {
+                let _ = crate::platform::open_path(&clip.path);
+            }
+            if ui
+                .button(egui::RichText::new("Удалить").color(DANGER))
+                .clicked()
+            {
+                *delete_request = Some(clip.path.clone());
+            }
+        });
+    });
+}
+
+/// «1 клип», «3 клипа», «11 клипов».
+fn clips_count(n: usize) -> String {
+    let word = match (n % 10, n % 100) {
+        (_, 11..=14) => "клипов",
+        (1, _) => "клип",
+        (2..=4, _) => "клипа",
+        _ => "клипов",
+    };
+    format!("{n} {word}")
 }
 
 fn file_name(p: &std::path::Path) -> String {
@@ -752,4 +874,180 @@ fn configure_style(ctx: &egui::Context) {
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(49, 66, 82);
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 94, 85);
     ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(shortcut: crate::shortcuts::ShortcutState, output: PathBuf) -> App {
+        let cfg = Config { output, ..Config::default() };
+        let (tx, rx) = mpsc::channel();
+        App {
+            draft: cfg.clone(),
+            rec: Arc::new(Recorder::new(cfg, Some(crate::audio::AudioCodec::Aac))),
+            service: Arc::new(CaptureService::inert()),
+            shortcuts: Arc::new(Shortcuts::inert(shortcut)),
+            clips: vec![Clip {
+                path: PathBuf::from("/tmp/replay_2026-09-24_08-15-49.mp4"),
+                size: 7_500_000,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+                thumb: None,
+            }],
+            tx,
+            rx,
+            toast: None,
+            pending_delete: None,
+            saving: false,
+            thumb_known: HashSet::new(),
+            last_scan: Instant::now(),
+        }
+    }
+
+    /// Прогоняет несколько кадров окна заданного размера и возвращает
+    /// ширину панели настроек. Кадров несколько: несжимаемая панель egui
+    /// подстраивается под содержимое прошлого кадра и может «расползаться».
+    fn settings_width(app: &mut App, ctx: &egui::Context, size: [f32; 2]) -> f32 {
+        for _ in 0..8 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into())),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+            out.textures_delta.clear();
+        }
+        egui::containers::panel::PanelState::load(ctx, egui::Id::new("settings"))
+            .map(|s| s.outer_rect.width())
+            .unwrap_or(f32::NAN)
+    }
+
+    /// Регрессия: несжимаемая панель настроек раздувалась под самую широкую
+    /// строку. На живой машине это была ошибка портала «An app id is
+    /// required» в ряду хоткея — панель заняла ~900 px, библиотеку сжало.
+    #[test]
+    fn settings_panel_keeps_its_width() {
+        use crate::shortcuts::ShortcutState;
+        let tmp = std::env::temp_dir().join("replay-gui");
+        let cases = [
+            ("норма", ShortcutState { registered: true, ..Default::default() }, tmp.clone()),
+            (
+                "ошибка портала",
+                ShortcutState {
+                    error: Some(
+                        "не удалось создать сеанс хоткеев: Portal request failed: \
+                         org.freedesktop.portal.Error.NotAllowed: An app id is required"
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+                tmp.clone(),
+            ),
+            (
+                "длинная привязка",
+                ShortcutState {
+                    registered: true,
+                    trigger: Some("Ctrl+Alt+Shift+Meta+S, Ctrl+Alt+Shift+Meta+R".into()),
+                    ..Default::default()
+                },
+                tmp.clone(),
+            ),
+            (
+                "длинный путь",
+                ShortcutState { registered: true, ..Default::default() },
+                PathBuf::from("/home/user/Videos/replays/очень/длинный/путь/к/папке/с/клипами"),
+            ),
+        ];
+        for (name, st, out) in cases {
+            for size in [[1130.0, 815.0], [760.0, 480.0], [1600.0, 900.0]] {
+                let ctx = egui::Context::default();
+                let mut app = test_app(st.clone(), out.clone());
+                let w = settings_width(&mut app, &ctx, size);
+                assert!(
+                    w <= SETTINGS_WIDTH + 1.0,
+                    "{name}, окно {size:?}: панель настроек {w:.0} px вместо {SETTINGS_WIDTH}"
+                );
+            }
+        }
+    }
+
+    /// Регрессия: на узкой панели кнопки карточки вылезали за правый край.
+    #[test]
+    fn clip_card_fits_a_narrow_panel() {
+        let ctx = egui::Context::default();
+        let clip = Clip {
+            path: PathBuf::from("/tmp/replay_2026-09-24_08-15-49.mp4"),
+            size: 7_500_000,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            thumb: None,
+        };
+        // Как на живом скриншоте: панель библиотеки ~220 px, содержимое уже.
+        let width = 190.0;
+        let mut card = egui::Rect::NOTHING;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, [width, 700.0].into())),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let mut del = None;
+                card = clip_row(ui, &clip, &mut del);
+            });
+        });
+        out.textures_delta.clear();
+        assert!(
+            card.right() <= width,
+            "карточка до x={:.0} при ширине окна {width}",
+            card.right()
+        );
+    }
+
+    #[test]
+    fn clips_count_declines() {
+        assert_eq!(clips_count(0), "0 клипов");
+        assert_eq!(clips_count(1), "1 клип");
+        assert_eq!(clips_count(3), "3 клипа");
+        assert_eq!(clips_count(5), "5 клипов");
+        assert_eq!(clips_count(11), "11 клипов");
+        assert_eq!(clips_count(12), "12 клипов");
+        assert_eq!(clips_count(21), "21 клип");
+        assert_eq!(clips_count(104), "104 клипа");
+    }
+
+    /// Регрессия: карточка раздувалась на всю высоту окна, а превью
+    /// оказывалось посреди пустоты, далеко под названием клипа.
+    #[test]
+    fn clip_card_hugs_its_thumbnail() {
+        let ctx = egui::Context::default();
+        let clip = Clip {
+            path: PathBuf::from("/tmp/replay_2026-01-01_00-00-00.mp4"),
+            size: 7_500_000,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            thumb: None,
+        };
+        let mut card_rect = egui::Rect::NOTHING;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, [900.0, 700.0].into())),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let top = ui.cursor().min.y;
+                let mut del = None;
+                clip_row(ui, &clip, &mut del);
+                card_rect = egui::Rect::from_min_max(
+                    egui::pos2(0.0, top),
+                    egui::pos2(900.0, ui.cursor().min.y),
+                );
+            });
+        });
+        out.textures_delta.clear();
+
+        // Превью 90 px плюс поля и отступ — никак не пол-окна.
+        assert!(
+            card_rect.height() < THUMB_SIZE.y + 60.0,
+            "карточка клипа высотой {:.0} px при превью {:.0} px",
+            card_rect.height(),
+            THUMB_SIZE.y
+        );
+    }
 }
