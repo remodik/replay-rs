@@ -3,11 +3,18 @@ pub mod config;
 pub mod gui;
 pub mod instance;
 pub mod pipeline;
+pub mod platform;
+#[cfg(target_os = "linux")]
 pub mod portal;
 pub mod recorder;
 pub mod ringbuf;
 pub mod saver;
 pub mod service;
+#[cfg(target_os = "linux")]
+pub mod shortcuts;
+#[cfg(windows)]
+#[path = "shortcuts_windows.rs"]
 pub mod shortcuts;
 pub mod thumbs;
+#[cfg(target_os = "linux")]
 pub mod tray;
