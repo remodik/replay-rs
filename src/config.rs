@@ -93,6 +93,8 @@ pub struct Config {
     pub max_mb: usize,
     pub output: PathBuf,
     pub encoder: Encoder,
+    /// Windows: -1 = основной монитор, остальные — индексы DXGI.
+    pub monitor: i32,
     pub width: u32,
     pub height: u32,
     pub audio: AudioConfig,
@@ -119,7 +121,12 @@ impl Default for Config {
             gop: 1.0,
             max_mb: 300,
             output: dirs_videos().join("replays"),
-            encoder: Encoder::Vah264enc,
+            encoder: if cfg!(windows) {
+                Encoder::X264enc
+            } else {
+                Encoder::Vah264enc
+            },
+            monitor: -1,
             width: 1920,
             height: 1080,
             audio: AudioConfig::default(),
@@ -130,7 +137,8 @@ impl Default for Config {
 impl Config {
     /// Настройки, которые нельзя применить без пересборки конвейера.
     pub fn needs_restart(&self, other: &Self) -> bool {
-        self.fps != other.fps
+        self.monitor != other.monitor
+            || self.fps != other.fps
             || self.bitrate != other.bitrate
             || self.gop != other.gop
             || self.encoder != other.encoder
@@ -169,6 +177,7 @@ impl Config {
     }
 }
 
+#[cfg(not(windows))]
 pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -176,6 +185,7 @@ pub fn config_dir() -> PathBuf {
         .join("replay-rs")
 }
 
+#[cfg(not(windows))]
 pub fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -184,9 +194,53 @@ pub fn cache_dir() -> PathBuf {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn dirs_videos() -> PathBuf {
     home().join("Videos")
+}
+
+#[cfg(windows)]
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData/Roaming"))
+        .join("replay-rs")
+}
+#[cfg(windows)]
+pub fn cache_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData/Local"))
+        .join("replay-rs/cache")
+}
+#[cfg(test)]
+mod portability_tests {
+    use super::*;
+    #[test]
+    fn old_config_defaults_to_primary_monitor_and_monitor_changes_restart() {
+        let cfg: Config = serde_json::from_str(r#"{"seconds":45.0}"#).unwrap();
+        assert_eq!(cfg.monitor, -1);
+        assert_eq!(cfg.seconds, 45.0);
+        let mut changed = cfg.clone();
+        changed.monitor = 1;
+        assert!(cfg.needs_restart(&changed));
+        let restored: Config =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(restored, changed);
+    }
+    #[test]
+    fn default_encoder_matches_platform() {
+        assert_eq!(
+            Config::default().encoder,
+            if cfg!(windows) {
+                Encoder::X264enc
+            } else {
+                Encoder::Vah264enc
+            }
+        );
+    }
 }
