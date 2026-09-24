@@ -61,6 +61,16 @@ pub struct Shortcuts {
     state: Arc<Mutex<ShortcutState>>,
 }
 
+#[cfg(test)]
+impl Shortcuts {
+    /// Заглушка для тестов раскладки окна: не ходит в портал и не
+    /// регистрирует хоткей в настройках KDE.
+    pub(crate) fn inert(state: ShortcutState) -> Self {
+        let (tx, _rx) = mpsc::channel();
+        Self { tx, state: Arc::new(Mutex::new(state)) }
+    }
+}
+
 impl Shortcuts {
     pub fn spawn(rec: Arc<Recorder>) -> Self {
         let (tx, rx) = mpsc::channel();
