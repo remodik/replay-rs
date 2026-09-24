@@ -1,6 +1,6 @@
 [package]
 name = "replay-rs"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2021"
 description = "Replay buffer screen recorder for Linux/Wayland and Windows 10/11"
 license = "MIT"

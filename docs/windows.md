@@ -2,9 +2,9 @@
 
 Windows-backend добавлен в исходники. Проверены типы и условная компиляция
 для Windows на Linux; нативная сборка MSVC и ручной прогон на Windows
-пока не подтверждены. Релиз v0.1.0 содержит только Linux-бинарь.
-Новый workflow `Windows` собирает ZIP после успешных проверок при push/PR
-или ручном запуске. Это ещё не опубликованный Windows-релиз.
+пока не подтверждены. Первая Windows-сборка — pre-release v0.2.0-beta.1:
+workflow `Windows` собирает её после успешных тестов и выкладывает в Releases.
+Linux-релиз — v0.1.0.
 
 ## Возможности
 
@@ -74,18 +74,20 @@ Launcher добавляет `bin` GStreamer в PATH только для проц
 системный и пользовательский PATH не меняются. DLL GStreamer в приложение не
 копируются, поэтому GStreamer Runtime должен оставаться установленным.
 
-### Из ZIP workflow `Windows`
+### Из ZIP релиза
 
 1. Установите GStreamer MSVC x86_64 Runtime (см. «Зависимости»).
-2. Откройте успешный запуск workflow `Windows` во вкладке Actions и скачайте
-   артефакт `replay-rs-windows-x86_64` (нужен вход в GitHub). Внутри —
-   `replay-rs-windows-x86_64.zip` и `SHA256SUMS`.
-3. Сверьте контрольную сумму и распакуйте архив:
+2. Скачайте со страницы Releases архив `replay-rs-<версия>-windows-x86_64.zip`
+   и `SHA256SUMS` в один каталог. Сборки с каждого push лежат там же в
+   виде артефакта `replay-rs-windows-x86_64` во вкладке Actions (нужен вход в
+   GitHub); в них архив называется `replay-rs-dev-windows-x86_64.zip`.
+3. Сверьте контрольную сумму и распакуйте архив (пример для v0.2.0-beta.1):
 
    ```powershell
-   (Get-FileHash .\replay-rs-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+   $zip = '.\replay-rs-v0.2.0-beta.1-windows-x86_64.zip'
+   (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
    Get-Content .\SHA256SUMS
-   Expand-Archive .\replay-rs-windows-x86_64.zip -DestinationPath .\replay-rs
+   Expand-Archive $zip -DestinationPath .\replay-rs
    Set-Location .\replay-rs
    ```
 

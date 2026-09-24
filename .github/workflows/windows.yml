@@ -14,6 +14,12 @@ jobs:
       GSTREAMER_1_0_ROOT_MSVC_X86_64: 'C:\gstreamer\1.0\msvc_x86_64\'
     steps:
       - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version" }
       - name: Install GStreamer runtime and development files
         shell: pwsh
         run: |
@@ -46,19 +52,50 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          $label = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME } else { 'dev' }
+          $zip = "replay-rs-$label-windows-x86_64.zip"
           $root = 'dist/replay-rs-windows-x86_64'
           New-Item -ItemType Directory -Force "$root/target/release", "$root/packaging", "$root/docs" | Out-Null
           Copy-Item target/release/replay-rs.exe "$root/target/release/"
           Copy-Item packaging/*windows.ps1 "$root/packaging/"
           Copy-Item README.md $root
           Copy-Item docs/windows.md, docs/architecture.md "$root/docs/"
-          Compress-Archive "$root/*" 'dist/replay-rs-windows-x86_64.zip'
-          $hash = (Get-FileHash 'dist/replay-rs-windows-x86_64.zip' -Algorithm SHA256).Hash.ToLower()
-          "$hash  replay-rs-windows-x86_64.zip" | Set-Content dist/SHA256SUMS -Encoding ascii
+          Compress-Archive "$root/*" "dist/$zip"
+          $hash = (Get-FileHash "dist/$zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Set-Content dist/SHA256SUMS -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
           name: replay-rs-windows-x86_64
           path: |
-            dist/replay-rs-windows-x86_64.zip
+            dist/*.zip
             dist/SHA256SUMS
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: replay-rs-windows-x86_64
+          path: dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Тег с суффиксом (v0.2.0-beta.1) — pre-release, он не становится Latest.
+          pre=()
+          if [[ "$TAG" == *-* ]]; then pre=(--prerelease); fi
+          notes="docs/releases/$TAG.md"
+          if [[ ! -f "$notes" ]]; then echo "Missing release notes: $notes" >&2; exit 1; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "replay-rs $TAG" \
+              --notes-file "$notes" "${pre[@]}"
+          fi
