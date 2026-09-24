@@ -24,10 +24,11 @@ case "${1:-}" in
     --uninstall) uninstall; exit 0 ;;
 esac
 
-if [ ! -x "$REPO/target/release/replay-rs" ]; then
-    echo "собираю release…"
-    (cd "$REPO" && cargo build --release)
-fi
+# Собираем всегда: сборка инкрементальная, и если всё актуально, это
+# секунды. Раньше сборка шла, только когда бинаря не было вовсе, и скрипт
+# молча ставил устаревший release, собранный до последних правок.
+echo "собираю release…"
+(cd "$REPO" && cargo build --release)
 
 install -Dm755 "$REPO/target/release/replay-rs" "$BIN"
 
