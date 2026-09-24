@@ -15,6 +15,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 
 use crate::pipeline;
+#[cfg(target_os = "linux")]
 use crate::portal;
 use crate::recorder::Recorder;
 
@@ -23,7 +24,10 @@ pub enum Mode {
     /// videotestsrc — без экрана и портала.
     Test,
     /// Реальный захват через xdg-desktop-portal.
+    #[cfg(target_os = "linux")]
     Portal,
+    #[cfg(windows)]
+    Desktop,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,11 +62,18 @@ impl CaptureService {
             .name("capture".into())
             .spawn(move || capture_thread(rec, mode, rx, st))
             .expect("не удалось запустить поток захвата");
-        Self { tx, state, handle: Some(handle) }
+        Self {
+            tx,
+            state,
+            handle: Some(handle),
+        }
     }
 
     pub fn state(&self) -> CaptureState {
-        self.state.lock().expect("состояние захвата отравлено").clone()
+        self.state
+            .lock()
+            .expect("состояние захвата отравлено")
+            .clone()
     }
 
     /// Просит поток пересобрать конвейер (после смены fps/битрейта/кодировщика).
@@ -87,6 +98,15 @@ impl CaptureService {
     }
 }
 
+#[cfg(test)]
+impl CaptureService {
+    /// Заглушка для тестов раскладки окна: без потока и без захвата.
+    pub(crate) fn inert() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        Self { tx, state: Arc::new(Mutex::new(CaptureState::Running)), handle: None }
+    }
+}
+
 impl Drop for CaptureService {
     fn drop(&mut self) {
         self.stop();
@@ -103,6 +123,7 @@ fn capture_thread(
 
     // Сессию портала открываем один раз: при пересборке конвейера повторный
     // диалог не нужен, PipeWire-поток продолжает жить.
+    #[cfg(target_os = "linux")]
     let screencast = match mode {
         Mode::Test => None,
         Mode::Portal => match open_screencast() {
@@ -122,12 +143,18 @@ fn capture_thread(
         // конвейеров нельзя.
         rec.reset_buffers();
         let cfg = rec.config();
+        #[cfg(target_os = "linux")]
         let source = match &screencast {
             Some(s) => s.source_desc(),
             None => pipeline::test_source(&cfg),
         };
 
-        let next = match run_once(&rec, &cfg, &source, &rx) {
+        #[cfg(windows)]
+        let source = match mode {
+            Mode::Test => pipeline::test_source(&cfg),
+            Mode::Desktop => crate::platform::windows_source(cfg.monitor),
+        };
+        let next = match run_once(&rec, &cfg, &source, &rx, &state) {
             Ok(cmd) => {
                 set(CaptureState::Running);
                 cmd
@@ -156,13 +183,13 @@ fn run_once(
     cfg: &crate::config::Config,
     source: &str,
     rx: &Rc<mpsc::Receiver<Command>>,
+    state: &Arc<Mutex<CaptureState>>,
 ) -> Result<Option<Command>> {
     // Ветку звука строим только если есть и настройка, и кодировщик.
     let audio_desc = rec
         .codec
         .and_then(|codec| pipeline::audio_branch(cfg, codec));
-    let gst_pipeline =
-        pipeline::build_pipeline_with_audio(cfg, source, audio_desc.as_deref())?;
+    let gst_pipeline = pipeline::build_pipeline_with_audio(cfg, source, audio_desc.as_deref())?;
     pipeline::attach_sink(&gst_pipeline, rec.ring.clone())?;
     if audio_desc.is_some() {
         if let Some(a) = &rec.audio {
@@ -221,6 +248,7 @@ fn run_once(
     gst_pipeline
         .set_state(gst::State::Playing)
         .context("конвейер захвата не запустился")?;
+    *state.lock().expect("состояние захвата отравлено") = CaptureState::Running;
     main_loop.run();
     let _ = gst_pipeline.set_state(gst::State::Null);
 
@@ -235,6 +263,7 @@ fn run_once(
 ///
 /// С валидным токеном KDE не показывает диалог выбора экрана. Если токен
 /// протух, забываем его и пробуем ещё раз — уже с диалогом.
+#[cfg(target_os = "linux")]
 fn open_screencast() -> Result<portal::ScreenCastSession> {
     let token = portal::load_token();
     if token.is_some() {
