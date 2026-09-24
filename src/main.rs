@@ -11,18 +11,22 @@ use clap::Parser;
 use gstreamer as gst;
 
 use replay_rs::audio;
-use replay_rs::instance;
 use replay_rs::config::{Config, Encoder};
+use replay_rs::instance;
 use replay_rs::recorder::Recorder;
 use replay_rs::service::{CaptureService, Mode};
 use replay_rs::shortcuts;
+#[cfg(target_os = "linux")]
 use replay_rs::tray;
 
 #[derive(Parser, Debug)]
-#[command(name = "replay-rs", about = "Replay buffer screen recorder (Wayland/KDE)")]
+#[command(
+    name = "replay-rs",
+    about = "Replay buffer screen recorder (Linux / Windows)"
+)]
 struct Args {
-    /// portal — реальный захват экрана; test — videotestsrc без экрана
-    #[arg(long, default_value = "portal")]
+    /// auto — захват экрана; test — тестовый источник; portal — Linux; desktop — Windows
+    #[arg(long, default_value = "auto")]
     mode: String,
 
     /// Работать без окна, трей и хоткей
@@ -44,6 +48,9 @@ struct Args {
     // Ниже — разовые переопределения сохранённых настроек.
     #[arg(long)]
     encoder: Option<String>,
+    /// Windows: индекс монитора DXGI, -1 — основной монитор
+    #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
+    monitor: Option<i32>,
     /// Длина буфера, с
     #[arg(long)]
     seconds: Option<f64>,
@@ -70,6 +77,7 @@ struct Args {
 }
 
 /// Сколько ждём остановки конвейера перед выходом.
+#[cfg(target_os = "linux")]
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Будим работающий процесс сигналом.
@@ -78,12 +86,14 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500
 /// системный редактор комбинаций. Второе нужно в headless-режиме, где окна
 /// с кнопкой просто нет.
 /// Уведомление на рабочий стол. Необязательное: нет notify-send — не беда.
+#[cfg(target_os = "linux")]
 fn notify(summary: &str, body: &str) {
     let _ = std::process::Command::new("notify-send")
         .args(["--app-name=replay-rs", "--icon=media-record", summary, body])
         .spawn();
 }
 
+#[cfg(target_os = "linux")]
 fn signal_running(sig: i32, what: &str) -> Result<()> {
     let pid = instance::running_pid()?;
     // SAFETY: kill с валидным pid — обычный системный вызов без побочных
@@ -98,6 +108,9 @@ fn signal_running(sig: i32, what: &str) -> Result<()> {
 /// Сохранённые настройки плюс разовые правки из командной строки.
 fn build_config(args: &Args) -> Result<Config> {
     let mut cfg = Config::load();
+    if let Some(monitor) = args.monitor {
+        cfg.monitor = monitor;
+    }
     if let Some(e) = &args.encoder {
         cfg.encoder = e.parse::<Encoder>().map_err(anyhow::Error::msg)?;
     }
@@ -138,18 +151,34 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
+    #[cfg(windows)]
+    if args.save || args.quit || args.configure_shortcut {
+        return shortcuts::send_command(if args.save {
+            shortcuts::SAVE
+        } else if args.quit {
+            shortcuts::QUIT
+        } else {
+            shortcuts::CONFIGURE
+        });
+    }
+    #[cfg(target_os = "linux")]
     if args.save {
         return signal_running(libc::SIGUSR1, "сохранение");
     }
+    #[cfg(target_os = "linux")]
     if args.configure_shortcut {
         return signal_running(libc::SIGUSR2, "открытие редактора комбинаций");
     }
+    #[cfg(target_os = "linux")]
     if args.quit {
         return signal_running(libc::SIGTERM, "остановка");
     }
 
     let mode = match args.mode.as_str() {
-        "portal" => Mode::Portal,
+        #[cfg(target_os = "linux")]
+        "auto" | "portal" => Mode::Portal,
+        #[cfg(windows)]
+        "auto" | "desktop" => Mode::Desktop,
         "test" => Mode::Test,
         other => bail!("неизвестный режим: {other}"),
     };
@@ -157,7 +186,9 @@ fn main() -> Result<()> {
     // Замок берём до тяжёлой инициализации: незачем поднимать второй
     // захват экрана, чтобы тут же его свернуть.
     let Some(_lock) = instance::acquire()? else {
-        let pid = instance::running_pid().map(|p| p.to_string()).unwrap_or_default();
+        let pid = instance::running_pid()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
         // При запуске из меню stderr никто не видит (Terminal=false), поэтому
         // говорим ещё и уведомлением — иначе клик по значку выглядит так,
         // будто ничего не произошло.
@@ -173,6 +204,11 @@ fn main() -> Result<()> {
     };
 
     let cfg = build_config(&args)?;
+    #[cfg(windows)]
+    anyhow::ensure!(
+        !cfg.encoder.is_va(),
+        "VA-API доступен только на Linux; используйте --encoder x264enc"
+    );
     gst::init().context("не удалось инициализировать GStreamer")?;
 
     // Кодек выбираем после gst::init(): без неё реестр элементов недоступен.
@@ -181,11 +217,11 @@ fn main() -> Result<()> {
         match choice {
             audio::CodecChoice::Exact(c) => log::info!("звук: {}", c.as_str()),
             audio::CodecChoice::FellBack(c) => log::warn!(
-                "запрошен AAC, но avenc_aac недоступен (поставьте gst-libav) — пишу в {}",
+                "запрошен AAC, но avenc_aac недоступен (нужен плагин libav) — пишу в {}",
                 c.as_str()
             ),
             audio::CodecChoice::None => log::warn!(
-                "звук включён, но нет ни avenc_aac (поставьте gst-libav), ни opusenc — пишу без звука"
+                "звук включён, но нет ни avenc_aac (нужен плагин libav), ни opusenc — пишу без звука"
             ),
         }
         choice.codec()
@@ -201,9 +237,17 @@ fn main() -> Result<()> {
     );
 
     let shortcuts = Arc::new(shortcuts::Shortcuts::spawn(rec.clone()));
+    #[cfg(target_os = "linux")]
     install_signal_handlers(&rec, &shortcuts, &service)?;
+    #[cfg(windows)]
+    anyhow::ensure!(
+        shortcuts.available(),
+        "не удалось запустить интеграцию Windows: {}",
+        shortcuts.state().summary()
+    );
 
     // Handle держим до конца main: с его смертью иконка пропадает.
+    #[cfg(target_os = "linux")]
     let _tray = match tray::spawn(rec.clone()) {
         Ok(h) => Some(h),
         Err(e) => {
@@ -221,34 +265,43 @@ fn main() -> Result<()> {
     }
 
     let result = if args.headless {
-        run_headless()
+        run_headless(&shortcuts)
     } else {
         run_gui(rec.clone(), service.clone(), shortcuts.clone())
     };
 
+    service.request_stop();
+    drop(service);
+    drop(shortcuts);
+    #[cfg(target_os = "linux")]
     let _ = std::fs::remove_file(instance::pidfile());
     result
 }
 
-fn run_headless() -> Result<()> {
+fn run_headless(_shortcuts: &shortcuts::Shortcuts) -> Result<()> {
     // Вся работа в фоновых потоках; главный просто ждёт сигнала.
     loop {
+        #[cfg(windows)]
+        {
+            if _shortcuts.should_quit() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        #[cfg(target_os = "linux")]
         std::thread::park();
     }
 }
 
-/// Показывает окно, а после его закрытия остаётся работать фоном.
-///
-/// Прятать окно в трей и доставать обратно на Wayland нельзя: winit там не
-/// умеет ни `set_visible`, ни поднять фокус. Поэтому крестик закрывает окно
-/// по-настоящему, а запись, буфер и иконка в трее продолжают жить — как в
-/// `--headless`. Вернуть окно без перезапуска не получится: цикл событий
-/// уже завершён.
+/// Windows: закрытие окна завершает приложение; Linux перехватывает крестик
+/// в GUI и сворачивает окно, сохраняя запись.
 fn run_gui(
     rec: Arc<Recorder>,
     service: Arc<CaptureService>,
     shortcuts: Arc<shortcuts::Shortcuts>,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let background_shortcuts = shortcuts.clone();
     let options = eframe::NativeOptions {
         // Задаём явно: на этом держится «закрыл окно — запись идёт дальше».
         // При false eframe вызывает process::exit(0) на закрытии окна, и всё
@@ -268,19 +321,24 @@ fn run_gui(
         "replay-rs",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(replay_rs::gui::App::new(cc, rec, service, shortcuts)))
+            Ok(Box::new(replay_rs::gui::App::new(
+                cc, rec, service, shortcuts,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("не удалось открыть окно: {e}"))?;
 
-    log::info!("окно закрыто, запись продолжается — выход через меню в трее");
-    run_headless()
+    #[cfg(target_os = "linux")]
+    return run_headless(&background_shortcuts);
+    #[cfg(windows)]
+    Ok(())
 }
 
 /// SIGUSR1 — сохранить клип, SIGINT/SIGTERM — выйти.
 ///
 /// glib 0.22 больше не биндит `unix_signal_add`, поэтому сигналы слушает
 /// отдельный поток.
+#[cfg(target_os = "linux")]
 fn install_signal_handlers(
     rec: &Arc<Recorder>,
     shortcuts: &Arc<shortcuts::Shortcuts>,
@@ -323,4 +381,9 @@ fn install_signal_handlers(
         })
         .context("не удалось запустить поток сигналов")?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn notify(summary: &str, body: &str) {
+    shortcuts::notify(summary, body);
 }
