@@ -17,6 +17,9 @@ pub struct InstanceLock {
 }
 
 pub fn pidfile() -> PathBuf {
+    #[cfg(windows)]
+    let dir = crate::config::config_dir();
+    #[cfg(not(windows))]
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -28,6 +31,9 @@ pub fn pidfile() -> PathBuf {
 /// `Ok(None)` — рекордер уже запущен.
 pub fn acquire() -> Result<Option<InstanceLock>> {
     let path = pidfile();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
