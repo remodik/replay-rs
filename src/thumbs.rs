@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -14,8 +14,14 @@ const PULL_TIMEOUT: gst::ClockTime = gst::ClockTime::from_seconds(10);
 
 /// Путь превью для клипа. Имя берём от клипа, чтобы не городить индекс.
 pub fn thumb_path(clip: &Path) -> PathBuf {
-    let stem = clip.file_stem().unwrap_or_default().to_string_lossy().to_string();
-    crate::config::cache_dir().join("thumbs").join(format!("{stem}.jpg"))
+    let stem = clip
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    crate::config::cache_dir()
+        .join("thumbs")
+        .join(format!("{stem}.jpg"))
 }
 
 /// Возвращает путь к превью, создавая его при первом обращении.
@@ -29,23 +35,18 @@ pub fn ensure_thumb(clip: &Path) -> Result<PathBuf> {
             .with_context(|| format!("не удалось создать {}", dir.display()))?;
     }
     let jpeg = grab_first_frame(clip)?;
-    std::fs::write(&out, jpeg)
-        .with_context(|| format!("не удалось записать {}", out.display()))?;
+    std::fs::write(&out, jpeg).with_context(|| format!("не удалось записать {}", out.display()))?;
     Ok(out)
 }
 
 /// Декодирует первый кадр и кодирует его в JPEG.
 fn grab_first_frame(clip: &Path) -> Result<Vec<u8>> {
-    let location = clip.to_str().context("путь к клипу не в UTF-8")?;
-    if location.contains(['!', '"', '\\']) {
-        bail!("путь к клипу ломает описание конвейера: {location}");
-    }
     // decodebin сам выберет vah264dec. pixel-aspect-ratio=1/1 обязателен:
     // без него videoscale оставляет исходную высоту и «сжимает» кадр, унося
     // пропорции в метаданные, которых egui не видит. С PAR 1/1 высота
     // вычисляется из ширины и исходных пропорций.
     let desc = format!(
-        "filesrc location=\"{location}\" ! decodebin ! videoconvert ! videoscale \
+        "filesrc name=input ! decodebin ! videoconvert ! videoscale \
          ! video/x-raw,width={THUMB_WIDTH},pixel-aspect-ratio=1/1 ! jpegenc \
          ! appsink name=out max-buffers=1 drop=false sync=false"
     );
@@ -53,6 +54,8 @@ fn grab_first_frame(clip: &Path) -> Result<Vec<u8>> {
         .context("не удалось собрать конвейер превью")?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow::anyhow!("parse::launch вернул не Pipeline"))?;
+
+    crate::platform::set_file_location(&pipeline, "input", clip)?;
 
     let sink = pipeline
         .by_name("out")
@@ -88,10 +91,5 @@ mod tests {
     fn thumb_path_follows_clip_name() {
         let p = thumb_path(Path::new("/x/replay_2026-01-01_00-00-00.mp4"));
         assert!(p.ends_with("replay_2026-01-01_00-00-00.jpg"), "{p:?}");
-    }
-
-    #[test]
-    fn rejects_paths_that_break_pipeline_syntax() {
-        assert!(grab_first_frame(Path::new("/tmp/a\"b.mp4")).is_err());
     }
 }
