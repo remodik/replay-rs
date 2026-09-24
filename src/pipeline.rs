@@ -61,7 +61,10 @@ pub fn audio_branch(cfg: &Config, codec: AudioCodec) -> Option<String> {
     if !cfg.audio.any_enabled() {
         return None;
     }
-    let parser = codec.parser().map(|p| format!("{p} ! ")).unwrap_or_default();
+    let parser = codec
+        .parser()
+        .map(|p| format!("{p} ! "))
+        .unwrap_or_default();
     // ignore-inactive-pads обязателен: приостановленный микрофон иначе
     // подвешивает весь микшер, ожидая от него буферы.
     let mut parts = vec![format!(
@@ -84,17 +87,27 @@ pub fn audio_branch(cfg: &Config, codec: AudioCodec) -> Option<String> {
         // @DEFAULT_MONITOR@ следует за устройством вывода по умолчанию,
         // поэтому смена колонок на наушники не требует перезапуска.
         parts.push(format!(
-            "pulsesrc device=@DEFAULT_MONITOR@ ! audioconvert ! audioresample \
+            "{source} ! audioconvert ! audioresample \
              ! {AUDIO_CAPS} ! volume volume={} ! amix.",
-            cfg.audio.system_volume
+            cfg.audio.system_volume,
+            source = if cfg!(windows) {
+                "wasapi2src loopback=true"
+            } else {
+                "pulsesrc device=@DEFAULT_MONITOR@"
+            }
         ));
     }
     if cfg.audio.mic {
         // Без device pulsesrc берёт источник записи по умолчанию.
         parts.push(format!(
-            "pulsesrc ! audioconvert ! audioresample \
+            "{source} ! audioconvert ! audioresample \
              ! {AUDIO_CAPS} ! volume volume={} ! amix.",
-            cfg.audio.mic_volume
+            cfg.audio.mic_volume,
+            source = if cfg!(windows) {
+                "wasapi2src"
+            } else {
+                "pulsesrc"
+            }
         ));
     }
     Some(parts.join(" "))
@@ -194,9 +207,7 @@ pub fn attach_sink(pipeline: &gst::Pipeline, ring: SharedBuffer) -> Result<()> {
                 let frame = Frame::new(map.as_slice().to_vec(), pts, keyframe);
                 // Мьютекс держим только на время вставки; при панике другого
                 // потока продолжать запись всё равно нельзя.
-                ring.lock()
-                    .map_err(|_| gst::FlowError::Error)?
-                    .add(frame);
+                ring.lock().map_err(|_| gst::FlowError::Error)?.add(frame);
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -258,10 +269,7 @@ fn running_time(sample: &gst::Sample, buffer: &gst::BufferRef) -> i64 {
 }
 
 fn monotonic_ns() -> i64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: передаём корректный указатель на timespec, ядро только пишет в него.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec * crate::ringbuf::NS + ts.tv_nsec
+    gst::glib::monotonic_time() * 1000
 }
 
 #[cfg(test)]
@@ -270,7 +278,13 @@ mod tests {
 
     #[test]
     fn vah264enc_uses_vbr_and_gop_in_frames() {
-        let cfg = Config { fps: 60, gop: 1.0, bitrate: 15000, ..Config::default() };
+        let cfg = Config {
+            encoder: Encoder::Vah264enc,
+            fps: 60,
+            gop: 1.0,
+            bitrate: 15000,
+            ..Config::default()
+        };
         let d = encoder_desc(&cfg);
         assert!(d.contains("rate-control=vbr"), "{d}");
         assert!(d.contains("key-int-max=60"), "{d}");
@@ -279,7 +293,10 @@ mod tests {
     #[test]
     fn lpenc_falls_back_to_cqp() {
         // vah264lpenc на этом железе не умеет VBR — только постоянный квантователь.
-        let cfg = Config { encoder: Encoder::Vah264lpenc, ..Config::default() };
+        let cfg = Config {
+            encoder: Encoder::Vah264lpenc,
+            ..Config::default()
+        };
         let d = encoder_desc(&cfg);
         assert!(!d.contains("rate-control"), "{d}");
         assert!(d.contains("qpi="), "{d}");
@@ -290,18 +307,27 @@ mod tests {
     /// not-negotiated. Преобразователь обязан стоять до videorate.
     #[test]
     fn converter_comes_before_videorate() {
-        let cfg = Config::default();
+        let cfg = Config {
+            encoder: Encoder::Vah264enc,
+            ..Config::default()
+        };
         let desc = build_description(&cfg, "fakesrc", None);
         let post = desc.find("vapostproc").expect("нет vapostproc");
         let rate = desc.find("videorate").expect("нет videorate");
-        assert!(post < rate, "vapostproc обязан стоять до videorate:\n{desc}");
+        assert!(
+            post < rate,
+            "vapostproc обязан стоять до videorate:\n{desc}"
+        );
     }
 
     /// Любой фильтр с частотой кадров должен нести признак памяти, иначе он
     /// молча исключает DMABuf.
     #[test]
     fn framerate_filter_keeps_memory_feature() {
-        let cfg = Config::default();
+        let cfg = Config {
+            encoder: Encoder::Vah264enc,
+            ..Config::default()
+        };
         let desc = build_description(&cfg, "fakesrc", None);
         for part in desc.split('!').map(str::trim) {
             if part.starts_with("video/x-raw") && part.contains("framerate=") {
@@ -315,7 +341,11 @@ mod tests {
 
     #[test]
     fn key_int_never_zero() {
-        let cfg = Config { fps: 30, gop: 0.01, ..Config::default() };
+        let cfg = Config {
+            fps: 30,
+            gop: 0.01,
+            ..Config::default()
+        };
         assert_eq!(cfg.key_int_max(), 1);
     }
 }
