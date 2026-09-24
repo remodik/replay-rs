@@ -61,13 +61,14 @@ pub fn write_clip_with_audio(
         "appsrc name=src is-live=false format=time block=true \
          caps=video/x-h264,stream-format=byte-stream,alignment=au,framerate={fps}/1 ! \
          h264parse ! mp4mux name=mux faststart=true ! \
-         filesink location={location}{audio_desc}",
-        location = gst_path_escape(out)?,
+         filesink name=output{audio_desc}",
     );
     let pipeline = gst::parse::launch(&desc)
         .context("не удалось собрать конвейер мьюксинга")?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow::anyhow!("parse::launch вернул не Pipeline"))?;
+
+    crate::platform::set_file_location(&pipeline, "output", out)?;
 
     let src = pipeline
         .by_name("src")
@@ -115,7 +116,9 @@ pub fn write_clip_with_audio(
             }
             _ => None,
         };
-        let video = video.join().map_err(|_| anyhow::anyhow!("поток видео упал"))?;
+        let video = video
+            .join()
+            .map_err(|_| anyhow::anyhow!("поток видео упал"))?;
         let sound = match sound {
             Some(h) => h.join().map_err(|_| anyhow::anyhow!("поток звука упал"))?,
             None => Ok(()),
@@ -140,7 +143,9 @@ fn push_frames(src: &gst_app::AppSrc, frames: &[Frame], fps: u32) -> Result<()> 
     for (i, f) in frames.iter().enumerate() {
         let mut gbuf = gst::Buffer::from_slice(f.data.clone());
         {
-            let b = gbuf.get_mut().expect("буфер только что создан, ссылка одна");
+            let b = gbuf
+                .get_mut()
+                .expect("буфер только что создан, ссылка одна");
             let pts = gst::ClockTime::from_nseconds((f.pts - base) as u64);
             b.set_pts(pts);
             b.set_dts(pts);
@@ -164,14 +169,18 @@ fn push_audio(src: &gst_app::AppSrc, frames: &[Frame], base: i64) -> Result<()> 
     for (i, f) in frames.iter().enumerate() {
         let mut gbuf = gst::Buffer::from_slice(f.data.clone());
         {
-            let b = gbuf.get_mut().expect("буфер только что создан, ссылка одна");
+            let b = gbuf
+                .get_mut()
+                .expect("буфер только что создан, ссылка одна");
             // Кадр мог начаться до начала клипа — прижимаем его к нулю,
             // иначе mp4mux получит отрицательный timestamp.
             let pts = gst::ClockTime::from_nseconds((f.pts - base).max(0) as u64);
             b.set_pts(pts);
             b.set_dts(pts);
             if let Some(next) = frames.get(i + 1) {
-                b.set_duration(gst::ClockTime::from_nseconds((next.pts - f.pts).max(0) as u64));
+                b.set_duration(gst::ClockTime::from_nseconds(
+                    (next.pts - f.pts).max(0) as u64
+                ));
             }
         }
         src.push_buffer(gbuf)
@@ -187,10 +196,11 @@ fn push_audio(src: &gst_app::AppSrc, frames: &[Frame], base: i64) -> Result<()> 
 /// Шину берём у конвейера, а не у элемента: у элементной шины не заведён
 /// poll, и `timed_pop_filtered` на ней падает с GStreamer-CRITICAL.
 fn wait_for_eos(pipeline: &gst::Pipeline) -> Result<()> {
-    let bus = pipeline
-        .bus()
-        .context("у конвейера мьюксинга нет шины")?;
-    match bus.timed_pop_filtered(MUX_TIMEOUT, &[gst::MessageType::Eos, gst::MessageType::Error]) {
+    let bus = pipeline.bus().context("у конвейера мьюксинга нет шины")?;
+    match bus.timed_pop_filtered(
+        MUX_TIMEOUT,
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    ) {
         None => bail!("мьюксинг не завершился за {} с", MUX_TIMEOUT.seconds()),
         Some(msg) => match msg.view() {
             gst::MessageView::Eos(_) => Ok(()),
@@ -200,16 +210,6 @@ fn wait_for_eos(pipeline: &gst::Pipeline) -> Result<()> {
             _ => unreachable!("шина отфильтрована на EOS и ERROR"),
         },
     }
-}
-
-/// `gst::parse::launch` разбирает строку, поэтому путь не должен содержать
-/// разделителей описания конвейера.
-fn gst_path_escape(p: &Path) -> Result<String> {
-    let s = p.to_str().context("путь к клипу не в UTF-8")?;
-    if s.contains(['!', ' ', '"', '\\']) {
-        bail!("путь к клипу содержит символы, ломающие описание конвейера: {s}");
-    }
-    Ok(s.to_string())
 }
 
 #[cfg(test)]
@@ -224,14 +224,11 @@ mod tests {
         assert!(first.ends_with("replay_2026-01-01_00-00-00.mp4"));
         std::fs::write(&first, b"x").unwrap();
         let second = clip_path(&dir, "2026-01-01_00-00-00");
-        assert!(second.ends_with("replay_2026-01-01_00-00-00_1.mp4"), "{second:?}");
+        assert!(
+            second.ends_with("replay_2026-01-01_00-00-00_1.mp4"),
+            "{second:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn rejects_paths_that_break_pipeline_syntax() {
-        assert!(gst_path_escape(Path::new("/tmp/a b.mp4")).is_err());
-        assert!(gst_path_escape(Path::new("/tmp/ok.mp4")).is_ok());
     }
 
     #[test]
