@@ -1,0 +1,64 @@
+name: Windows
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    env:
+      GST_VERSION: '1.26.10'
+      GSTREAMER_1_0_ROOT_MSVC_X86_64: 'C:\gstreamer\1.0\msvc_x86_64\'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GStreamer runtime and development files
+        shell: pwsh
+        run: |
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc"
+          foreach ($kind in @('gstreamer-1.0', 'gstreamer-1.0-devel')) {
+            $name = "$kind-msvc-x86_64-$env:GST_VERSION.msi"
+            $file = Join-Path $env:RUNNER_TEMP $name
+            Invoke-WebRequest "$base/$name" -OutFile $file
+            $checksum = (Invoke-WebRequest "$base/$name.sha256sum").Content
+            if ($checksum -is [byte[]]) { $checksum = [Text.Encoding]::UTF8.GetString($checksum) }
+            $expected = ($checksum.Trim() -split '\s+')[0]
+            if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $expected) { throw "Checksum mismatch: $name" }
+            $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i `"$file`" /qn /norestart ADDLOCAL=ALL INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64"
+            if ($process.ExitCode -notin @(0, 3010)) { throw "MSI failed: $($process.ExitCode)" }
+          }
+          "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin" >> $env:GITHUB_PATH
+          "PKG_CONFIG_PATH=$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\lib\pkgconfig" >> $env:GITHUB_ENV
+      - name: Toolchain
+        run: rustup update stable --no-self-update
+      - name: Verify required plugins
+        shell: pwsh
+        run: |
+          foreach ($plugin in @('d3d11screencapturesrc', 'wasapi2src', 'x264enc', 'avenc_aac', 'mp4mux', 'jpegenc')) {
+            gst-inspect-1.0 $plugin
+            if ($LASTEXITCODE -ne 0) { throw "Missing GStreamer plugin: $plugin" }
+          }
+      - run: cargo +stable test --locked
+      - run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - run: cargo +stable build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $root = 'dist/replay-rs-windows-x86_64'
+          New-Item -ItemType Directory -Force "$root/target/release", "$root/packaging", "$root/docs" | Out-Null
+          Copy-Item target/release/replay-rs.exe "$root/target/release/"
+          Copy-Item packaging/*windows.ps1 "$root/packaging/"
+          Copy-Item README.md $root
+          Copy-Item docs/windows.md, docs/architecture.md "$root/docs/"
+          Compress-Archive "$root/*" 'dist/replay-rs-windows-x86_64.zip'
+          $hash = (Get-FileHash 'dist/replay-rs-windows-x86_64.zip' -Algorithm SHA256).Hash.ToLower()
+          "$hash  replay-rs-windows-x86_64.zip" | Set-Content dist/SHA256SUMS -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-rs-windows-x86_64
+          path: |
+            dist/replay-rs-windows-x86_64.zip
+            dist/SHA256SUMS
+          if-no-files-found: error

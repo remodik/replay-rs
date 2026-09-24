@@ -29,7 +29,7 @@ pub fn open_path(path: &Path) -> Result<()> {
         use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
         let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let verb: Vec<u16> = "open\0".encode_utf16().collect();
-        // SAFETY: NUL-terminated UTF-16 buffers live throughout the call.
+        // SAFETY: буферы UTF-16 завершены NUL и живут всё время вызова.
         let result = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),

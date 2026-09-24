@@ -81,7 +81,7 @@ impl Shortcuts {
     }
     pub fn open_settings(&self) {
         if self.window != 0 {
-            // SAFETY: handle belongs to our integration thread; no pointers in message.
+            // SAFETY: окно принадлежит нашему потоку интеграции; указателей в сообщении нет.
             unsafe {
                 PostMessageW(self.window as HWND, CONFIGURE, 0, 0);
             }
@@ -91,7 +91,7 @@ impl Shortcuts {
 impl Drop for Shortcuts {
     fn drop(&mut self) {
         if self.window != 0 {
-            // SAFETY: message requests destruction on the window's own thread.
+            // SAFETY: сообщение просит закрыть окно в его собственном потоке.
             unsafe {
                 PostMessageW(self.window as HWND, WM_CLOSE, 0, 0);
             }
@@ -105,7 +105,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 fn window_name() -> Vec<u16> {
-    // A per-user name; Windows additionally isolates windows by interactive session.
+    // Имя своё у каждого пользователя; вдобавок Windows разделяет окна по сессиям.
     wide(&format!(
         "replay-rs commands: {}",
         crate::config::config_dir().display()
@@ -113,7 +113,7 @@ fn window_name() -> Vec<u16> {
 }
 pub fn send_command(command: u32) -> Result<()> {
     let name = window_name();
-    // SAFETY: valid UTF-16 string; messages carry no addresses or external data.
+    // SAFETY: строка в корректном UTF-16; в сообщениях нет адресов и внешних данных.
     unsafe {
         let hwnd = FindWindowW(null(), name.as_ptr());
         if hwnd.is_null() {
@@ -126,7 +126,7 @@ pub fn send_command(command: u32) -> Result<()> {
     Ok(())
 }
 pub fn notify(title: &str, body: &str) {
-    // SAFETY: both strings are NUL-terminated and kept alive for the call.
+    // SAFETY: обе строки завершены NUL и живут всё время вызова.
     unsafe {
         MessageBoxW(
             null_mut(),
@@ -138,7 +138,7 @@ pub fn notify(title: &str, body: &str) {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: called by Windows on the owner thread with a live window handle.
+    // SAFETY: Windows вызывает процедуру в потоке-владельце с живым окном.
     unsafe {
         if msg == TRAY && (l as u32 == WM_RBUTTONUP || l as u32 == WM_LBUTTONUP) {
             let menu = CreatePopupMenu();
@@ -190,8 +190,8 @@ fn run(
     quit: Arc<AtomicBool>,
     ready: mpsc::SyncSender<usize>,
 ) -> Result<()> {
-    // SAFETY: all UI resources are created, used and destroyed on this thread.
-    // All Win32 strings and structs remain alive for their corresponding calls.
+    // SAFETY: все ресурсы интерфейса создаются, используются и уничтожаются
+    // в этом потоке. Строки и структуры Win32 живут всё время своих вызовов.
     unsafe {
         let instance = GetModuleHandleW(null());
         let class = wide("ReplayRsCommands");
