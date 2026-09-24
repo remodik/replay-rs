@@ -49,6 +49,20 @@ pub struct Shortcuts {
     window: usize,
     thread: Option<std::thread::JoinHandle<()>>,
 }
+#[cfg(test)]
+impl Shortcuts {
+    /// Заглушка для тестов раскладки окна: не создаёт окно команд и не
+    /// регистрирует хоткей.
+    pub(crate) fn inert(state: ShortcutState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            quit: Arc::new(AtomicBool::new(false)),
+            window: 0,
+            thread: None,
+        }
+    }
+}
+
 impl Shortcuts {
     pub fn spawn(rec: Arc<Recorder>) -> Self {
         let state = Arc::new(Mutex::new(ShortcutState::default()));
