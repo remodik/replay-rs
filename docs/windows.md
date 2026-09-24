@@ -113,7 +113,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\install-windows.
 
 | Параметр | Назначение |
 | --- | --- |
-| `-GStreamerRoot <путь>` | Каталог GStreamer, например `'D:\GStreamer\1.0\msvc_x86_64'`. По умолчанию — `GSTREAMER_1_0_ROOT_MSVC_X86_64`, иначе `C:\gstreamer\1.0\msvc_x86_64`. Установщик проверяет наличие `bin\gstreamer-1.0-0.dll`. |
+| `-GStreamerRoot <путь>` | Каталог GStreamer, например `'D:\GStreamer\1.0\msvc_x86_64'`. По умолчанию — `GSTREAMER_1_0_ROOT_MSVC_X86_64`, иначе `C:\gstreamer\1.0\msvc_x86_64` или `%ProgramFiles%\gstreamer\1.0\msvc_x86_64`. Установщик проверяет наличие `bin\gstreamer-1.0-0.dll`. |
 | `-Binary <путь>` | Другой `replay-rs.exe`. По умолчанию — `..\target\release\replay-rs.exe` относительно скрипта. |
 | `-Autostart` | Добавить запуск без окна (`--headless`) после входа в Windows. |
 | `-Uninstall` | Удалить приложение и ярлыки. |

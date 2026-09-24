@@ -20,7 +20,12 @@ if ($Uninstall) {
     Write-Host 'Application removed. Settings, clips and GStreamer are preserved.'
     return
 }
-if (-not $GStreamerRoot) { $GStreamerRoot = 'C:\gstreamer\1.0\msvc_x86_64' }
+if (-not $GStreamerRoot) {
+    $GStreamerRoot = @('C:\gstreamer\1.0\msvc_x86_64', (Join-Path $env:ProgramFiles 'gstreamer\1.0\msvc_x86_64')) |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'bin\gstreamer-1.0-0.dll') } |
+        Select-Object -First 1
+    if (-not $GStreamerRoot) { throw 'Install GStreamer MSVC x86_64 Runtime (Complete), or specify -GStreamerRoot.' }
+}
 $GStreamerRoot = (Resolve-Path -LiteralPath $GStreamerRoot).Path
 if (-not (Test-Path -LiteralPath (Join-Path $GStreamerRoot 'bin\gstreamer-1.0-0.dll'))) {
     throw 'Install GStreamer MSVC x86_64 Runtime (Complete), or specify -GStreamerRoot.'
