@@ -43,14 +43,22 @@ fn restart_keeps_the_timeline_usable() {
 
     std::thread::sleep(Duration::from_secs(6));
     let before = rec.stats();
-    println!("до пересборки: {:.1} с, {} GOP", before.seconds(), before.gops);
+    println!(
+        "до пересборки: {:.1} с, {} GOP",
+        before.seconds(),
+        before.gops
+    );
     assert!(before.nanos > 0, "буфер не наполнился");
 
     service.restart();
     std::thread::sleep(Duration::from_secs(6));
 
     let after = rec.stats();
-    println!("после пересборки: {:.1} с, {} GOP", after.seconds(), after.gops);
+    println!(
+        "после пересборки: {:.1} с, {} GOP",
+        after.seconds(),
+        after.gops
+    );
     assert!(
         after.nanos >= 0,
         "длительность буфера ушла в минус ({} нс) — старые кадры смешались с новыми",

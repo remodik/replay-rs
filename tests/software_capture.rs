@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 fn software_recording_saves_unicode_paths_and_previews() {
     gst::init().unwrap();
     let cfg = Config {
-        encoder: Encoder::X264enc,
+        encoder: Encoder::Element("x264enc".into()),
         width: 320,
         height: 180,
         fps: 30,

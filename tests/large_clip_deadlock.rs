@@ -18,7 +18,7 @@ use std::time::Duration;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use replay_rs::audio::{self, AudioRingBuffer};
+use replay_rs::audio;
 use replay_rs::config::Config;
 use replay_rs::pipeline::SharedAudio;
 use replay_rs::ringbuf::GopRingBuffer;
@@ -53,10 +53,7 @@ fn large_clip_with_audio_does_not_deadlock() {
     cfg.audio.system = true;
 
     let ring = Arc::new(Mutex::new(GopRingBuffer::new(cfg.seconds, cfg.max_bytes())));
-    let sa = SharedAudio {
-        buffer: Arc::new(Mutex::new(AudioRingBuffer::new(30.0, 16 << 20))),
-        caps: Arc::new(Mutex::new(None)),
-    };
+    let sa = SharedAudio::new(audio::TrackKind::System, 30.0, 16 << 20);
 
     // pattern=snow почти не сжимается — быстро набираем объём.
     let source = format!(
@@ -75,7 +72,11 @@ fn large_clip_with_audio_does_not_deadlock() {
 
     let vframes = ring.lock().unwrap().snapshot();
     let bytes: usize = vframes.iter().map(|f| f.data.len()).sum();
-    println!("видео: {} кадров, {:.1} КБ", vframes.len(), bytes as f64 / 1e3);
+    println!(
+        "видео: {} кадров, {:.1} КБ",
+        vframes.len(),
+        bytes as f64 / 1e3
+    );
     assert!(
         bytes > 200_000,
         "нужен клип больше очереди appsrc (200 КБ), получено {bytes} Б"
@@ -97,7 +98,10 @@ fn large_clip_with_audio_does_not_deadlock() {
         let r = saver::write_clip_with_audio(
             &vframes,
             60,
-            Some(saver::AudioTrack { frames: &aframes, caps: &caps }),
+            Some(saver::AudioTrack {
+                frames: &aframes,
+                caps: &caps,
+            }),
             &c,
         );
         let _ = tx.send(r);

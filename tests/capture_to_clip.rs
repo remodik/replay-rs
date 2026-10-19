@@ -9,7 +9,7 @@ use std::time::Duration;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use replay_rs::audio::{self, AudioRingBuffer};
+use replay_rs::audio;
 use replay_rs::config::Config;
 use replay_rs::pipeline::SharedAudio;
 use replay_rs::ringbuf::{GopRingBuffer, NS};
@@ -44,16 +44,25 @@ fn capture_encodes_saves_and_thumbnails() {
     let p = pipeline::build_pipeline(&cfg, &source).expect("конвейер не собрался");
     pipeline::attach_sink(&p, ring.clone()).expect("appsink не подключился");
 
-    p.set_state(gst::State::Playing).expect("конвейер не запустился");
+    p.set_state(gst::State::Playing)
+        .expect("конвейер не запустился");
     std::thread::sleep(Duration::from_secs(CAPTURE_SECS));
-    p.set_state(gst::State::Null).expect("конвейер не остановился");
+    p.set_state(gst::State::Null)
+        .expect("конвейер не остановился");
 
     let stats = ring.lock().unwrap().stats();
     assert!(stats.frames > 0, "энкодер не отдал ни одного кадра");
-    assert!(stats.gops >= 2, "ожидалось несколько GOP, получено {}", stats.gops);
+    assert!(
+        stats.gops >= 2,
+        "ожидалось несколько GOP, получено {}",
+        stats.gops
+    );
 
     let frames = ring.lock().unwrap().snapshot_last(CLIP_SECS);
-    assert!(frames[0].keyframe, "срез буфера обязан начинаться с keyframe");
+    assert!(
+        frames[0].keyframe,
+        "срез буфера обязан начинаться с keyframe"
+    );
     let span = (frames[frames.len() - 1].pts - frames[0].pts) as f64 / NS as f64;
     assert!(span >= CLIP_SECS, "срез короче запрошенного: {span}");
 
@@ -118,10 +127,7 @@ fn capture_with_audio_produces_two_tracks() {
     cfg.audio.mic = false;
 
     let ring = Arc::new(Mutex::new(GopRingBuffer::new(cfg.seconds, cfg.max_bytes())));
-    let shared_audio = SharedAudio {
-        buffer: Arc::new(Mutex::new(AudioRingBuffer::new(20.0, 8 << 20))),
-        caps: Arc::new(Mutex::new(None)),
-    };
+    let shared_audio = SharedAudio::new(audio::TrackKind::System, 20.0, 8 << 20);
 
     let source = pipeline::test_source(&cfg);
     let abranch = pipeline::audio_branch(&cfg, codec).expect("ветка звука не собралась");
@@ -130,12 +136,17 @@ fn capture_with_audio_produces_two_tracks() {
     pipeline::attach_sink(&p, ring.clone()).expect("видео-appsink не подключился");
     pipeline::attach_audio_sink(&p, shared_audio.clone()).expect("аудио-appsink не подключился");
 
-    p.set_state(gst::State::Playing).expect("конвейер не запустился");
+    p.set_state(gst::State::Playing)
+        .expect("конвейер не запустился");
     std::thread::sleep(Duration::from_secs(CAPTURE_SECS));
-    p.set_state(gst::State::Null).expect("конвейер не остановился");
+    p.set_state(gst::State::Null)
+        .expect("конвейер не остановился");
 
     let vframes = ring.lock().unwrap().snapshot_last(CLIP_SECS);
-    assert!(vframes[0].keyframe, "срез видео обязан начинаться с keyframe");
+    assert!(
+        vframes[0].keyframe,
+        "срез видео обязан начинаться с keyframe"
+    );
 
     let a_stats = shared_audio.buffer.lock().unwrap().stats();
     assert!(a_stats.frames > 0, "звуковых кадров не пришло");
@@ -165,12 +176,20 @@ fn capture_with_audio_produces_two_tracks() {
         vframes[0].pts
     );
 
-    let caps = shared_audio.caps.lock().unwrap().clone().expect("caps звука не заполнились");
+    let caps = shared_audio
+        .caps
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("caps звука не заполнились");
     let clip = dir.join("clip_av.mp4");
     saver::write_clip_with_audio(
         &vframes,
         cfg.fps,
-        Some(saver::AudioTrack { frames: &aframes, caps: &caps }),
+        Some(saver::AudioTrack {
+            frames: &aframes,
+            caps: &caps,
+        }),
         &clip,
     )
     .expect("клип со звуком не записался");
