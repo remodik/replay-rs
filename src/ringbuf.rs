@@ -25,7 +25,11 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(data: impl Into<Arc<[u8]>>, pts: i64, keyframe: bool) -> Self {
-        Self { data: data.into(), pts, keyframe }
+        Self {
+            data: data.into(),
+            pts,
+            keyframe,
+        }
     }
 }
 
@@ -103,7 +107,10 @@ impl GopRingBuffer {
     pub fn add(&mut self, frame: Frame) {
         let len = frame.data.len();
         if frame.keyframe {
-            self.gops.push_back(Gop { frames: vec![frame], bytes: len });
+            self.gops.push_back(Gop {
+                frames: vec![frame],
+                bytes: len,
+            });
         } else if let Some(gop) = self.gops.back_mut() {
             gop.frames.push(frame);
             gop.bytes += len;
@@ -204,7 +211,11 @@ mod tests {
     ) -> i64 {
         let n = (seconds * FPS as f64) as i64;
         for i in start_idx..start_idx + n {
-            buf.add(Frame::new(vec![b'x'; frame_size], i * FRAME_NS, i % gop == 0));
+            buf.add(Frame::new(
+                vec![b'x'; frame_size],
+                i * FRAME_NS,
+                i % gop == 0,
+            ));
         }
         start_idx + n
     }
@@ -295,7 +306,10 @@ mod tests {
         buf.set_limits(5.0, 1_000_000_000);
         let span = buf.stats().nanos;
         assert!((5 * NS..=6 * NS).contains(&span), "{span}");
-        assert!(buf.snapshot()[0].keyframe, "инвариант keyframe должен пережить подрезку");
+        assert!(
+            buf.snapshot()[0].keyframe,
+            "инвариант keyframe должен пережить подрезку"
+        );
     }
 
     /// Регрессия: после пересборки конвейера время идёт с нуля. Если не
@@ -314,7 +328,11 @@ mod tests {
 
         feed_at(&mut buf, 2.0, 100, 0, GOP); // «после перезапуска», с нуля
         let st = buf.stats();
-        assert!(st.nanos >= 0, "длительность буфера ушла в минус: {}", st.nanos);
+        assert!(
+            st.nanos >= 0,
+            "длительность буфера ушла в минус: {}",
+            st.nanos
+        );
         let pts: Vec<i64> = buf.snapshot().iter().map(|f| f.pts).collect();
         let mut sorted = pts.clone();
         sorted.sort_unstable();
