@@ -289,7 +289,7 @@ fn run(
                     });
                 }
                 OPEN_FOLDER => {
-                    let _ = crate::platform::open_path(&rec.config().output);
+                    crate::platform::open_or_warn(&rec.config().output);
                 }
                 msg if msg == taskbar_created && taskbar_created != 0 => {
                     Shell_NotifyIconW(NIM_ADD, &icon);
