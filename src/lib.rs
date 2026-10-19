@@ -1,9 +1,14 @@
 pub mod audio;
 pub mod config;
+pub mod encoders;
 pub mod gui;
 pub mod instance;
+pub mod media;
+pub mod overlay;
 pub mod pipeline;
 pub mod platform;
+pub mod player;
+pub mod player_view;
 #[cfg(target_os = "linux")]
 pub mod portal;
 pub mod recorder;
@@ -18,3 +23,4 @@ pub mod shortcuts;
 pub mod thumbs;
 #[cfg(target_os = "linux")]
 pub mod tray;
+pub mod trim;
