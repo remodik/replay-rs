@@ -279,6 +279,7 @@ fn hevc_capture_saves_hevc_clip() {
     }
     let dir = temp_dir("hevc");
     let cfg = Config {
+        encoder: Encoder::Auto,
         video_codec: VideoCodec::H265,
         ..capture_config(&dir)
     };
