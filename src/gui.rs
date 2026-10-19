@@ -51,6 +51,11 @@ pub struct App {
     /// Превью уже считаются или не собрались — второй раз не запускаем.
     thumb_known: HashSet<PathBuf>,
     last_scan: Instant,
+    /// Открытый просмотр клипа. Пока он есть, плеер декодирует; закрыли —
+    /// конвейер плеера освобождается.
+    viewer: Option<crate::player_view::PlayerView>,
+    /// Поток оверлея: состояние для настроек и пробуждение по «Применить».
+    overlay: Option<Arc<crate::overlay::Overlay>>,
 }
 
 impl App {
@@ -59,6 +64,7 @@ impl App {
         rec: Arc<Recorder>,
         service: Arc<CaptureService>,
         shortcuts: Arc<Shortcuts>,
+        overlay: Arc<crate::overlay::Overlay>,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
@@ -77,6 +83,8 @@ impl App {
             saving: false,
             thumb_known: HashSet::new(),
             last_scan: Instant::now(),
+            viewer: None,
+            overlay: Some(overlay),
         };
         app.refresh_clips();
         app
@@ -204,12 +212,20 @@ impl App {
 
     fn apply_settings(&mut self) {
         let needs_restart = self.rec.update_config(self.draft.clone());
+        if needs_restart {
+            self.service.restart();
+        }
+        if let Some(o) = &self.overlay {
+            o.wake();
+        }
         if let Err(e) = self.draft.store() {
-            self.toast(format!("настройки не сохранились: {e:#}"), true);
+            self.toast(
+                format!("настройки применены, но не сохранились на диск: {e:#}"),
+                true,
+            );
             return;
         }
         if needs_restart {
-            self.service.restart();
             self.toast("настройки применены, конвейер пересобирается".into(), false);
         } else {
             self.toast("настройки применены".into(), false);
@@ -268,7 +284,13 @@ impl App {
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(22))
-            .show(ui, |ui| self.clips_panel(ui));
+            .show(ui, |ui| {
+                if self.viewer.is_some() {
+                    self.viewer_panel(ui);
+                } else {
+                    self.clips_panel(ui);
+                }
+            });
 
         self.confirm_delete_window(&ctx);
     }
@@ -348,12 +370,35 @@ impl App {
                 cfg.max_mb
             ))
             .on_hover_text(format!("{} групп кадров в видеобуфере", stats.gops));
-            if let Some(a) = &self.rec.audio {
-                let st = a.buffer.lock().expect("звуковой буфер отравлен").stats();
+            let audio = self.rec.audio_stats();
+            if let Some((_, st)) = audio.first() {
                 ui.separator();
-                ui.weak(format!("Звук  {:.0} с", st.seconds()));
+                let text = match audio.len() {
+                    1 => format!("Звук  {:.0} с", st.seconds()),
+                    n => format!("Звук  {n} дорожки · {:.0} с", st.seconds()),
+                };
+                ui.weak(text).on_hover_text(
+                    audio
+                        .iter()
+                        .map(|(kind, st)| format!("{}: {:.1} с", kind.label(), st.seconds()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
             }
         });
+
+        if let Some(spec) = self.rec.encoder_status().active {
+            ui.weak(format!(
+                "{} · {}",
+                spec.codec.label(),
+                if spec.hardware {
+                    spec.backend.label()
+                } else {
+                    "программно"
+                }
+            ))
+            .on_hover_text(spec.label());
+        }
 
         if let CaptureState::Failed(err) = self.service.state() {
             ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
@@ -400,6 +445,7 @@ impl App {
             ui.label("Монитор (-1 — основной)");
             ui.add(egui::DragValue::new(&mut self.draft.monitor).range(-1..=64));
         }
+        self.encoder_section(ui);
         ui.label("Битрейт");
         ui.add(egui::Slider::new(&mut self.draft.bitrate, 1000..=100_000).suffix(" кбит/с"));
         ui.label("Кадров в секунду");
@@ -410,73 +456,12 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         section_title(ui, "Звук");
-        match self.rec.codec {
-            Some(c) => {
-                ui.horizontal(|ui| {
-                    ui.label("кодек");
-                    egui::ComboBox::from_id_salt("audio_codec")
-                        .selected_text(self.draft.audio.codec.label())
-                        .show_ui(ui, |ui| {
-                            for p in [
-                                crate::audio::CodecPreference::Auto,
-                                crate::audio::CodecPreference::Aac,
-                                crate::audio::CodecPreference::Opus,
-                            ] {
-                                ui.selectable_value(&mut self.draft.audio.codec, p, p.label());
-                            }
-                        });
-                });
-                ui.label(
-                    egui::RichText::new(format!("сейчас пишется: {}", c.as_str()))
-                        .small()
-                        .weak(),
-                );
-                // Запрошенный AAC мог подмениться на Opus — это видно только
-                // здесь, в логе строка уже уехала.
-                if self.draft.audio.codec == crate::audio::CodecPreference::Aac
-                    && c != crate::audio::AudioCodec::Aac
-                {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 180, 80),
-                        if cfg!(windows) {
-                            "AAC недоступен — установите GStreamer Complete"
-                        } else {
-                            "AAC недоступен — поставьте gst-libav"
-                        },
-                    );
-                }
-                ui.checkbox(&mut self.draft.audio.system, "Системный звук");
-                ui.add_enabled(
-                    self.draft.audio.system,
-                    egui::Slider::new(&mut self.draft.audio.system_volume, 0.0..=2.0)
-                        .text("громкость"),
-                );
-                ui.checkbox(&mut self.draft.audio.mic, "Микрофон");
-                ui.add_enabled(
-                    self.draft.audio.mic,
-                    egui::Slider::new(&mut self.draft.audio.mic_volume, 0.0..=2.0)
-                        .text("громкость"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.draft.audio.bitrate, 64..=320).suffix(" кбит/с"),
-                );
-            }
-            None => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 180, 80),
-                    "кодировщика звука нет",
-                );
-                ui.label(
-                    egui::RichText::new(if cfg!(windows) {
-                        "Установите GStreamer Complete с AAC или Opus"
-                    } else {
-                        "поставьте gst-libav (AAC) — opusenc тоже подойдёт"
-                    })
-                    .small()
-                    .weak(),
-                );
-            }
-        }
+        self.audio_section(ui);
+
+        ui.add_space(10.0);
+        ui.separator();
+        section_title(ui, "Оверлей и уведомления");
+        self.overlay_section(ui);
 
         ui.add_space(10.0);
         ui.separator();
@@ -490,7 +475,7 @@ impl App {
             self.draft.output = PathBuf::from(dir);
         }
         if ui.button("Открыть папку").clicked() {
-            let _ = crate::platform::open_path(&self.draft.output);
+            crate::platform::open_or_warn(&self.draft.output);
         }
 
         ui.add_space(12.0);
@@ -519,6 +504,328 @@ impl App {
                     .weak(),
             );
         }
+    }
+
+    /// Кодек и кодировщик: в списке только то, что прошло проверку на
+    /// этой машине. Пока проверка идёт, доступен «Автоматически».
+    fn encoder_section(&mut self, ui: &mut egui::Ui) {
+        use crate::config::Encoder;
+        use crate::encoders::VideoCodec;
+
+        let status = self.rec.encoder_status();
+        let found = status.discovery.clone();
+        let working_codecs = found.as_ref().map(|d| d.codecs()).unwrap_or_default();
+
+        ui.label("Видеокодек");
+        let current_codec = crate::encoders::codec_for(&self.draft);
+        let mut codec = current_codec;
+        egui::ComboBox::from_id_salt("video_codec")
+            .selected_text(codec.label())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for c in VideoCodec::ALL {
+                    // AV1 показываем, только если его уже выбрали из командной
+                    // строки: в окне он не предлагается как рабочая функция.
+                    if !c.in_ui() && c != current_codec {
+                        continue;
+                    }
+                    let works = working_codecs.contains(&c);
+                    let label = if works || found.is_none() {
+                        c.label().to_owned()
+                    } else {
+                        format!("{} — нет кодировщика", c.label())
+                    };
+                    ui.add_enabled_ui(works || c == current_codec, |ui| {
+                        ui.selectable_value(&mut codec, c, label);
+                    });
+                }
+            });
+        if codec != current_codec {
+            self.draft.video_codec = codec;
+            // Ручной выбор другого кодека теряет смысл — возвращаемся к авто.
+            self.draft.encoder = Encoder::Auto;
+        }
+        if codec == VideoCodec::H265 {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "HEVC меньше по размеру, но открывается не везде: часть \
+                         браузеров и старые плееры его не играют.",
+                    )
+                    .small()
+                    .weak(),
+                )
+                .wrap(),
+            );
+        }
+
+        ui.label("Кодировщик");
+        let selected = match &self.draft.encoder {
+            Encoder::Auto => "Автоматически".to_owned(),
+            Encoder::Element(e) => found
+                .as_ref()
+                .and_then(|d| d.find(e))
+                .map(|p| p.spec.label())
+                .unwrap_or_else(|| e.clone()),
+        };
+        egui::ComboBox::from_id_salt("video_encoder")
+            .selected_text(selected)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.draft.encoder, Encoder::Auto, "Автоматически");
+                if let Some(d) = &found {
+                    for spec in d.working(codec) {
+                        ui.selectable_value(
+                            &mut self.draft.encoder,
+                            Encoder::Element(spec.element.clone()),
+                            spec.label(),
+                        )
+                        .on_hover_text(spec.rank_reason());
+                    }
+                }
+            });
+
+        match &status.active {
+            Some(spec) => {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("сейчас: {}", spec.label()))
+                            .small()
+                            .weak(),
+                    )
+                    .wrap(),
+                );
+            }
+            None if found.is_none() => {
+                ui.label(egui::RichText::new("проверяю кодировщики…").small().weak());
+            }
+            None => {}
+        }
+        if let Some(note) = &status.note {
+            ui.add(egui::Label::new(egui::RichText::new(note).small().color(WARNING)).wrap());
+        }
+        if let Some(d) = &found {
+            egui::CollapsingHeader::new(egui::RichText::new("Диагностика кодировщиков").small())
+                .id_salt("encoder_diag")
+                .show(ui, |ui| {
+                    for p in &d.probed {
+                        let color = if p.outcome.works() { ACCENT } else { MUTED };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    p.spec.element,
+                                    p.outcome.label()
+                                ))
+                                .small()
+                                .color(color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new("Полный отчёт: replay-rs --list-encoders")
+                            .small()
+                            .weak(),
+                    );
+                });
+        }
+    }
+
+    fn audio_section(&mut self, ui: &mut egui::Ui) {
+        use crate::audio::{AudioCodec, AudioSource, CodecPreference};
+        use crate::config::AudioMode;
+
+        ui.label("Режим записи");
+        let mut mode = self.draft.audio.mode();
+        egui::ComboBox::from_id_salt("audio_mode")
+            .selected_text(mode.label())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for m in AudioMode::ALL {
+                    ui.selectable_value(&mut mode, m, m.label());
+                }
+            });
+        if mode != self.draft.audio.mode() {
+            self.draft.audio.set_mode(mode);
+        }
+        if mode == AudioMode::Separate {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "В клипе две звуковые дорожки: 1 — системный звук, 2 — микрофон. \
+                         Плееры обычно играют первую, вторую выбирают в меню дорожек.",
+                    )
+                    .small()
+                    .weak(),
+                )
+                .wrap(),
+            );
+        }
+        if mode == AudioMode::Off {
+            return;
+        }
+
+        let codec = self.rec.codec();
+        ui.horizontal(|ui| {
+            ui.label("Кодек");
+            egui::ComboBox::from_id_salt("audio_codec")
+                .selected_text(self.draft.audio.codec.label())
+                .show_ui(ui, |ui| {
+                    for p in [
+                        CodecPreference::Auto,
+                        CodecPreference::Aac,
+                        CodecPreference::Opus,
+                    ] {
+                        ui.selectable_value(&mut self.draft.audio.codec, p, p.label());
+                    }
+                });
+        });
+        match codec {
+            Some(c) => {
+                ui.label(
+                    egui::RichText::new(format!("сейчас пишется: {}", c.as_str()))
+                        .small()
+                        .weak(),
+                );
+                // Запрошенный AAC мог подмениться на Opus — это видно только
+                // здесь, в логе строка уже уехала.
+                if self.draft.audio.codec == CodecPreference::Aac && c != AudioCodec::Aac {
+                    ui.colored_label(
+                        WARNING,
+                        if cfg!(windows) {
+                            "AAC недоступен — установите GStreamer Complete"
+                        } else {
+                            "AAC недоступен — поставьте gst-libav"
+                        },
+                    );
+                }
+            }
+            // Звук в применённых настройках выключен — кодек ещё не выбирали.
+            None if !self.rec.config().audio.any_enabled() => {
+                let label = match crate::audio::choose_codec(self.draft.audio.codec).codec() {
+                    Some(c) => format!("будет писаться: {} — после «Применить»", c.as_str()),
+                    None => "кодировщика звука нет".to_owned(),
+                };
+                ui.label(egui::RichText::new(label).small().weak());
+            }
+            None => {
+                ui.colored_label(WARNING, "кодировщика звука нет");
+                ui.label(
+                    egui::RichText::new(if cfg!(windows) {
+                        "Установите GStreamer Complete с AAC или Opus"
+                    } else {
+                        "поставьте gst-libav (AAC) — opusenc тоже подойдёт"
+                    })
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+
+        for source in AudioSource::ALL {
+            let enabled = match source {
+                AudioSource::System => self.draft.audio.system,
+                AudioSource::Mic => self.draft.audio.mic,
+            };
+            if !enabled {
+                continue;
+            }
+            ui.add_space(4.0);
+            let status = self.rec.meters.get(source).status();
+            let mut retry = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(source.label());
+                source_indicator(ui, &status);
+                if matches!(status, crate::audio::SourceStatus::Failed(_))
+                    && ui
+                        .small_button("Повторить")
+                        .on_hover_text("Пересобрать запись и снова открыть источник")
+                        .clicked()
+                {
+                    retry = true;
+                }
+            });
+            if retry {
+                // Пересборка без изменения настроек: поток захвата забывает
+                // отказавшие источники и открывает их заново.
+                self.service.restart();
+                self.toast(format!("{}: пробую открыть снова", source.label()), false);
+            }
+            let volume = match source {
+                AudioSource::System => &mut self.draft.audio.system_volume,
+                AudioSource::Mic => &mut self.draft.audio.mic_volume,
+            };
+            ui.add(egui::Slider::new(volume, 0.0..=2.0).text("громкость"));
+        }
+        ui.add_space(4.0);
+        ui.label("Битрейт дорожки");
+        ui.add(egui::Slider::new(&mut self.draft.audio.bitrate, 64..=320).suffix(" кбит/с"));
+    }
+
+    fn overlay_section(&mut self, ui: &mut egui::Ui) {
+        use crate::config::{OverlayCorner, OverlayShow};
+        let o = &mut self.draft.overlay;
+        ui.checkbox(&mut o.enabled, "Оверлей поверх игры");
+        if o.enabled {
+            egui::ComboBox::from_id_salt("overlay_corner")
+                .selected_text(o.corner.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for c in OverlayCorner::ALL {
+                        ui.selectable_value(&mut o.corner, c, c.label());
+                    }
+                });
+            egui::ComboBox::from_id_salt("overlay_show")
+                .selected_text(match o.show {
+                    OverlayShow::Always => "показывать всегда",
+                    OverlayShow::AfterSave => "только после сохранения",
+                })
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut o.show, OverlayShow::Always, "показывать всегда");
+                    ui.selectable_value(
+                        &mut o.show,
+                        OverlayShow::AfterSave,
+                        "только после сохранения",
+                    );
+                });
+            ui.checkbox(&mut o.compact, "Компактный — одна строка");
+            ui.checkbox(&mut o.interactive, "Кнопка «Сохранить» в оверлее")
+                .on_hover_text(
+                    "Выключите, чтобы оверлей не принимал мышь и клики проходили в игру",
+                );
+            ui.add(
+                egui::Slider::new(&mut o.opacity, 0.3..=1.0)
+                    .text("непрозрачность")
+                    .show_value(false),
+            );
+            if let Some(ov) = &self.overlay {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("сейчас: {}", ov.availability().label()))
+                            .small()
+                            .weak(),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(if cfg!(windows) {
+                        "Поверх игр в окне без рамки; поверх эксклюзивного \
+                         полноэкранного режима не показывается."
+                    } else {
+                        "Поверх полноэкранных игр в KDE Plasma и композиторах на \
+                         wlroots; в GNOME и gamescope — обычным окном."
+                    })
+                    .small()
+                    .weak(),
+                )
+                .wrap(),
+            );
+        }
+        ui.checkbox(&mut o.notify_on_save, "Уведомление после сохранения");
     }
 
     /// Хоткей назначает композитор, а не мы: на Wayland клавиши раздаёт он.
@@ -643,7 +950,7 @@ impl App {
             self.refresh_clips();
         }
         if open_folder {
-            let _ = crate::platform::open_path(&self.rec.config().output);
+            crate::platform::open_or_warn(&self.rec.config().output);
         }
         ui.weak("Последние сохранённые моменты · новые сверху");
         ui.add_space(18.0);
@@ -667,17 +974,47 @@ impl App {
             return;
         }
 
-        let mut delete_request = None;
+        let mut request = None;
         egui::ScrollArea::vertical()
             .id_salt("clips_scroll")
             .show(ui, |ui| {
                 for clip in &self.clips {
-                    clip_row(ui, clip, &mut delete_request);
+                    clip_row(ui, clip, &mut request);
                     ui.add_space(10.0);
                 }
             });
-        if let Some(p) = delete_request {
-            self.pending_delete = Some(p);
+        match request {
+            Some(ClipAction::Delete(p)) => self.pending_delete = Some(p),
+            Some(ClipAction::View(p)) => {
+                self.viewer = Some(crate::player_view::PlayerView::open(&p, ui.ctx()))
+            }
+            None => {}
+        }
+    }
+
+    fn viewer_panel(&mut self, ui: &mut egui::Ui) {
+        let cfg = self.rec.config();
+        let encoder = self.rec.encoder_status().active;
+        let Some(viewer) = &mut self.viewer else {
+            return;
+        };
+        use crate::player_view::ViewAction;
+        match viewer.ui(ui, cfg.bitrate, encoder) {
+            ViewAction::None => {}
+            ViewAction::Close => self.viewer = None,
+            ViewAction::Exported(out) => {
+                self.toast(
+                    format!(
+                        "фрагмент сохранён: {} ({} – {})",
+                        file_name(&out.output),
+                        crate::player_view::fmt_time(out.start.nseconds() as f64 / 1e9),
+                        crate::player_view::fmt_time(out.end.nseconds() as f64 / 1e9),
+                    ),
+                    false,
+                );
+                self.refresh_clips();
+            }
+            ViewAction::Notice(text, is_error) => self.toast(text, is_error),
         }
     }
 
@@ -722,33 +1059,40 @@ const SETTINGS_WIDTH: f32 = 310.0;
 /// Высота превью в списке клипов; ширина — под 16:9.
 const THUMB_SIZE: egui::Vec2 = egui::vec2(160.0, 90.0);
 
+/// Что попросили сделать с клипом из карточки.
+enum ClipAction {
+    View(PathBuf),
+    Delete(PathBuf),
+}
+
 /// Карточка одного клипа: превью, имя, метаданные, кнопки.
-fn clip_row(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option<PathBuf>) -> egui::Rect {
-    let rect = card().show(ui, |ui| {
-        ui.set_min_width((ui.available_width() - 2.0).max(0.0));
-        // На узком окне метаданные переходят под превью.
-        let compact = ui.available_width() < 460.0;
-        if compact {
-            ui.vertical(|ui| clip_row_contents(ui, clip, delete_request));
-        } else {
-            // Высоту ряда ограничиваем высотой превью. with_layout с
-            // горизонтальной раскладкой внутри вертикальной панели забирает
-            // всю оставшуюся высоту: карточка раздувалась на всё окно, а
-            // превью центрировалось посреди этой пустоты, далеко под текстом.
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), THUMB_SIZE.y),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| clip_row_contents(ui, clip, delete_request),
-            );
-        }
-    })
-    .response
-    .rect;
+fn clip_row(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option<ClipAction>) -> egui::Rect {
+    let rect = card()
+        .show(ui, |ui| {
+            ui.set_min_width((ui.available_width() - 2.0).max(0.0));
+            // На узком окне метаданные переходят под превью.
+            let compact = ui.available_width() < 460.0;
+            if compact {
+                ui.vertical(|ui| clip_row_contents(ui, clip, delete_request));
+            } else {
+                // Высоту ряда ограничиваем высотой превью. with_layout с
+                // горизонтальной раскладкой внутри вертикальной панели забирает
+                // всю оставшуюся высоту: карточка раздувалась на всё окно, а
+                // превью центрировалось посреди этой пустоты, далеко под текстом.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), THUMB_SIZE.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| clip_row_contents(ui, clip, delete_request),
+                );
+            }
+        })
+        .response
+        .rect;
     ui.add_space(10.0);
     rect
 }
 
-fn clip_row_contents(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option<PathBuf>) {
+fn clip_row_contents(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option<ClipAction>) {
     // На узкой карточке превью сжимается под её ширину с сохранением 16:9:
     // превью фиксированной ширины само вылезало за правый край.
     let thumb = if ui.available_width() < THUMB_SIZE.x {
@@ -786,17 +1130,55 @@ fn clip_row_contents(ui: &mut egui::Ui, clip: &Clip, delete_request: &mut Option
         ui.add_space(6.0);
         // С переносом: на узкой карточке «Удалить» вылезал за правый край.
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Открыть клип").clicked() {
-                let _ = crate::platform::open_path(&clip.path);
+            if ui
+                .button("Смотреть")
+                .on_hover_text("Просмотр и обрезка внутри replay-rs")
+                .clicked()
+            {
+                *delete_request = Some(ClipAction::View(clip.path.clone()));
+            }
+            if ui
+                .button("Открыть")
+                .on_hover_text("Во внешнем плеере")
+                .clicked()
+            {
+                crate::platform::open_or_warn(&clip.path);
             }
             if ui
                 .button(egui::RichText::new("Удалить").color(DANGER))
                 .clicked()
             {
-                *delete_request = Some(clip.path.clone());
+                *delete_request = Some(ClipAction::Delete(clip.path.clone()));
             }
         });
     });
+}
+
+/// Точка и подпись состояния источника звука: есть ли сигнал прямо сейчас.
+fn source_indicator(ui: &mut egui::Ui, status: &crate::audio::SourceStatus) {
+    use crate::audio::SourceStatus;
+    let color = match status {
+        SourceStatus::Signal { .. } => ACCENT,
+        SourceStatus::Failed(_) => DANGER,
+        SourceStatus::NoData => WARNING,
+        SourceStatus::Silent | SourceStatus::Off => MUTED,
+    };
+    let resp = ui.label(
+        egui::RichText::new(format!("● {}", status.label()))
+            .color(color)
+            .small(),
+    );
+    match status {
+        SourceStatus::Failed(reason) => {
+            resp.on_hover_text(format!(
+                "{reason}\nЗапись идёт без этого источника. «Повторить» откроет его снова."
+            ));
+        }
+        SourceStatus::NoData => {
+            resp.on_hover_text("Источник открыт, но буферов от него нет: например, ничего не играет. В клип пойдёт тишина.");
+        }
+        _ => {}
+    }
 }
 
 /// «1 клип», «3 клипа», «11 клипов».
@@ -881,7 +1263,10 @@ mod tests {
     use super::*;
 
     fn test_app(shortcut: crate::shortcuts::ShortcutState, output: PathBuf) -> App {
-        let cfg = Config { output, ..Config::default() };
+        let cfg = Config {
+            output,
+            ..Config::default()
+        };
         let (tx, rx) = mpsc::channel();
         App {
             draft: cfg.clone(),
@@ -901,6 +1286,8 @@ mod tests {
             saving: false,
             thumb_known: HashSet::new(),
             last_scan: Instant::now(),
+            viewer: None,
+            overlay: None,
         }
     }
 
@@ -929,7 +1316,14 @@ mod tests {
         use crate::shortcuts::ShortcutState;
         let tmp = std::env::temp_dir().join("replay-gui");
         let cases = [
-            ("норма", ShortcutState { registered: true, ..Default::default() }, tmp.clone()),
+            (
+                "норма",
+                ShortcutState {
+                    registered: true,
+                    ..Default::default()
+                },
+                tmp.clone(),
+            ),
             (
                 "ошибка портала",
                 ShortcutState {
@@ -953,7 +1347,10 @@ mod tests {
             ),
             (
                 "длинный путь",
-                ShortcutState { registered: true, ..Default::default() },
+                ShortcutState {
+                    registered: true,
+                    ..Default::default()
+                },
                 PathBuf::from("/home/user/Videos/replays/очень/длинный/путь/к/папке/с/клипами"),
             ),
         ];
@@ -970,6 +1367,94 @@ mod tests {
         }
     }
 
+    /// Секция звука во всех режимах — включая отказ микрофона с длинной
+    /// причиной — не раздувает панель настроек.
+    #[test]
+    fn audio_section_fits_in_every_mode() {
+        use crate::audio::AudioSource;
+        use crate::config::AudioMode;
+        let tmp = std::env::temp_dir().join("replay-gui-audio");
+        for mode in AudioMode::ALL {
+            let ctx = egui::Context::default();
+            let mut app = test_app(
+                crate::shortcuts::ShortcutState {
+                    registered: true,
+                    ..Default::default()
+                },
+                tmp.clone(),
+            );
+            app.draft.audio.set_mode(mode);
+            app.rec.meters.get(AudioSource::Mic).fail(
+                "Failed to connect: No such entity — очень длинная причина отказа \
+                 микрофона, которая не должна растягивать панель"
+                    .into(),
+            );
+            let w = settings_width(&mut app, &ctx, [1130.0, 815.0]);
+            assert!(
+                w <= SETTINGS_WIDTH + 1.0,
+                "{mode:?}: панель настроек {w:.0} px вместо {SETTINGS_WIDTH}"
+            );
+        }
+    }
+
+    /// Просмотр битого клипа показывает ошибку, а не виснет и не падает;
+    /// «← Библиотека» возвращает список.
+    #[test]
+    fn viewer_of_broken_clip_reports_error_and_closes() {
+        gstreamer::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("replay-gui-view-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("replay_broken.mp4");
+        std::fs::write(&broken, b"not an mp4 at all").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app(
+            crate::shortcuts::ShortcutState {
+                registered: true,
+                ..Default::default()
+            },
+            dir.clone(),
+        );
+        app.viewer = Some(crate::player_view::PlayerView::open(&broken, &ctx));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    [1130.0, 815.0].into(),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+            out.textures_delta.clear();
+            text = format!("{:?}", out.shapes);
+            if text.contains("Не открылся") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(text.contains("Не открылся"), "нет сообщения об ошибке");
+        assert!(app.viewer.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Раздел оверлея со всеми настройками не раздувает панель.
+    #[test]
+    fn overlay_section_fits() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(
+            crate::shortcuts::ShortcutState {
+                registered: true,
+                ..Default::default()
+            },
+            std::env::temp_dir().join("replay-gui-overlay"),
+        );
+        app.draft.overlay.enabled = true;
+        app.draft.overlay.notify_on_save = true;
+        let w = settings_width(&mut app, &ctx, [760.0, 480.0]);
+        assert!(w <= SETTINGS_WIDTH + 1.0, "панель настроек {w:.0} px");
+    }
+
     /// Регрессия: на узкой панели кнопки карточки вылезали за правый край.
     #[test]
     fn clip_card_fits_a_narrow_panel() {
@@ -984,7 +1469,10 @@ mod tests {
         let width = 190.0;
         let mut card = egui::Rect::NOTHING;
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, [width, 700.0].into())),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                [width, 700.0].into(),
+            )),
             ..Default::default()
         };
         let mut out = ctx.run_ui(input, |ui| {
@@ -1026,7 +1514,10 @@ mod tests {
         };
         let mut card_rect = egui::Rect::NOTHING;
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, [900.0, 700.0].into())),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                [900.0, 700.0].into(),
+            )),
             ..Default::default()
         };
         let mut out = ctx.run_ui(input, |ui| {
