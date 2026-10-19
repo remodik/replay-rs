@@ -4,6 +4,9 @@
 //! от друга, поэтому GOP'ов здесь нет и резать можно по любому кадру.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::ringbuf::{Frame, Stats, NS};
 
@@ -105,6 +108,233 @@ fn has_element(name: &str) -> bool {
     gstreamer::ElementFactory::find(name).is_some()
 }
 
+/// Откуда берётся звук.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AudioSource {
+    /// Монитор устройства вывода (на Windows — loopback WASAPI).
+    System,
+    Mic,
+}
+
+impl AudioSource {
+    pub const ALL: [AudioSource; 2] = [AudioSource::System, AudioSource::Mic];
+
+    /// Короткое имя для элементов конвейера: `src_sys`, `level_mic`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            AudioSource::System => "sys",
+            AudioSource::Mic => "mic",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioSource::System => "Системный звук",
+            AudioSource::Mic => "Микрофон",
+        }
+    }
+
+    /// Имя элемента-источника в конвейере. По нему ошибку шины относят к
+    /// конкретному источнику, а не ко всему захвату.
+    pub fn element_name(self) -> String {
+        format!("src_{}", self.tag())
+    }
+
+    pub fn level_name(self) -> String {
+        format!("level_{}", self.tag())
+    }
+
+    /// Источник, которому принадлежит элемент с таким именем.
+    pub fn from_element_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|s| name == s.element_name() || name == s.level_name())
+    }
+
+    /// Источник, внутри ветки которого живёт объект.
+    ///
+    /// Описание источника обёрнуто в bin с именем `src_*`, поэтому ошибку
+    /// любого его элемента — самого pulsesrc или, скажем, `identity`, через
+    /// который тест изображает отказ, — можно отнести к источнику по предкам.
+    pub fn owning(obj: &gstreamer::Object) -> Option<Self> {
+        use gstreamer::prelude::*;
+        let mut cur = Some(obj.clone());
+        while let Some(o) = cur {
+            if let Some(s) = Self::from_element_name(o.name().as_str()) {
+                return Some(s);
+            }
+            cur = o.parent();
+        }
+        None
+    }
+}
+
+/// Что лежит в звуковой дорожке клипа.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrackKind {
+    System,
+    Mic,
+    /// Системный звук и микрофон, сведённые в одну дорожку.
+    Mixed,
+}
+
+impl TrackKind {
+    pub fn tag(self) -> &'static str {
+        match self {
+            TrackKind::System => "sys",
+            TrackKind::Mic => "mic",
+            TrackKind::Mixed => "mix",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TrackKind::System => "Системный звук",
+            TrackKind::Mic => "Микрофон",
+            TrackKind::Mixed => "Системный звук + микрофон",
+        }
+    }
+
+    /// Имя звукового appsink дорожки в конвейере захвата.
+    pub fn sink_name(self) -> String {
+        format!("asink_{}", self.tag())
+    }
+}
+
+/// Одна дорожка, которую должен писать конвейер, и её источники.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackPlan {
+    pub kind: TrackKind,
+    pub sources: Vec<AudioSource>,
+}
+
+/// Порог, ниже которого пик считаем тишиной, дБFS.
+pub const SILENCE_DB: f32 = -60.0;
+/// Сколько можно не получать измерений, прежде чем сказать «нет данных».
+/// `level` присылает их раз в `LEVEL_INTERVAL`, поэтому запас трёхкратный.
+const STALE_AFTER_MS: u64 = 1500;
+/// Как часто `level` присылает уровень. Чаще не нужно: это индикатор, а не
+/// измерительный прибор, и каждое сообщение — пробуждение потока захвата.
+pub const LEVEL_INTERVAL_NS: u64 = 500_000_000;
+
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    // +1: ноль означает «измерений ещё не было».
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Живое состояние одного источника: открылся ли он и есть ли сигнал.
+///
+/// Пишет поток захвата (по сообщениям `level` и ошибкам шины), читают GUI,
+/// трей и оверлей. Атомики вместо мьютекса: читатели дёргают его каждый кадр.
+#[derive(Debug, Default)]
+pub struct SourceMeter {
+    /// Источник есть в текущем конвейере.
+    active: AtomicBool,
+    peak_db_bits: AtomicU32,
+    updated_ms: AtomicU64,
+    /// Почему источник не пишется: не открылся или отвалился посреди записи.
+    failure: Mutex<Option<String>>,
+}
+
+/// Что показать пользователю про источник.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceStatus {
+    /// Выключен в настройках или конвейер ещё не собран.
+    Off,
+    /// Не открылся или отвалился; запись идёт без него.
+    Failed(String),
+    /// Источник в конвейере, но буферов от него нет (например, монитор
+    /// вывода, пока ничего не играет).
+    NoData,
+    Silent,
+    Signal {
+        peak_db: f32,
+    },
+}
+
+impl SourceStatus {
+    pub fn label(&self) -> String {
+        match self {
+            SourceStatus::Off => "выключен".into(),
+            SourceStatus::Failed(_) => "недоступен".into(),
+            SourceStatus::NoData => "нет данных".into(),
+            SourceStatus::Silent => "тишина".into(),
+            SourceStatus::Signal { peak_db } => format!("сигнал {peak_db:.0} дБ"),
+        }
+    }
+}
+
+impl SourceMeter {
+    /// Источник вошёл в новый конвейер: прошлые измерения и ошибки неактуальны.
+    pub fn activate(&self) {
+        self.active.store(true, Ordering::Release);
+        self.updated_ms.store(0, Ordering::Release);
+        *self.failure.lock().expect("состояние источника отравлено") = None;
+    }
+
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        self.updated_ms.store(0, Ordering::Release);
+    }
+
+    pub fn fail(&self, reason: String) {
+        self.active.store(false, Ordering::Release);
+        *self.failure.lock().expect("состояние источника отравлено") = Some(reason);
+    }
+
+    /// Сбрасывает отказ: перед новой попыткой открыть источник.
+    pub fn clear_failure(&self) {
+        *self.failure.lock().expect("состояние источника отравлено") = None;
+    }
+
+    pub fn record_peak(&self, peak_db: f32) {
+        self.peak_db_bits
+            .store(peak_db.to_bits(), Ordering::Relaxed);
+        self.updated_ms.store(now_ms(), Ordering::Release);
+    }
+
+    pub fn status(&self) -> SourceStatus {
+        if let Some(reason) = self
+            .failure
+            .lock()
+            .expect("состояние источника отравлено")
+            .clone()
+        {
+            return SourceStatus::Failed(reason);
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return SourceStatus::Off;
+        }
+        let at = self.updated_ms.load(Ordering::Acquire);
+        if at == 0 || now_ms().saturating_sub(at) > STALE_AFTER_MS {
+            return SourceStatus::NoData;
+        }
+        let peak_db = f32::from_bits(self.peak_db_bits.load(Ordering::Relaxed));
+        if peak_db < SILENCE_DB {
+            SourceStatus::Silent
+        } else {
+            SourceStatus::Signal { peak_db }
+        }
+    }
+}
+
+/// Индикаторы обоих источников.
+#[derive(Debug, Default)]
+pub struct SourceMeters {
+    pub system: SourceMeter,
+    pub mic: SourceMeter,
+}
+
+impl SourceMeters {
+    pub fn get(&self, source: AudioSource) -> &SourceMeter {
+        match source {
+            AudioSource::System => &self.system,
+            AudioSource::Mic => &self.mic,
+        }
+    }
+}
+
 /// Кольцевой буфер закодированного звука.
 #[derive(Debug)]
 pub struct AudioRingBuffer {
@@ -181,6 +411,11 @@ impl AudioRingBuffer {
             .collect()
     }
 
+    /// Метка самого свежего кадра.
+    pub fn last_pts(&self) -> Option<i64> {
+        self.frames.back().map(|f| f.pts)
+    }
+
     pub fn stats(&self) -> Stats {
         if self.frames.is_empty() {
             return Stats::default();
@@ -212,9 +447,52 @@ mod tests {
     fn preference_is_reported_honestly() {
         // Подмену запрошенного AAC на Opus обязаны отметить как FellBack,
         // иначе пользователь думает, что пишет AAC.
-        assert_eq!(CodecChoice::FellBack(AudioCodec::Opus).codec(), Some(AudioCodec::Opus));
+        assert_eq!(
+            CodecChoice::FellBack(AudioCodec::Opus).codec(),
+            Some(AudioCodec::Opus)
+        );
         assert_eq!(CodecChoice::None.codec(), None);
         assert_eq!(CodecPreference::default(), CodecPreference::Auto);
+    }
+
+    #[test]
+    fn meter_reports_failure_signal_and_silence() {
+        let m = SourceMeter::default();
+        assert_eq!(m.status(), SourceStatus::Off);
+        m.activate();
+        assert_eq!(m.status(), SourceStatus::NoData, "измерений ещё не было");
+        m.record_peak(-12.0);
+        assert_eq!(m.status(), SourceStatus::Signal { peak_db: -12.0 });
+        m.record_peak(-90.0);
+        assert_eq!(m.status(), SourceStatus::Silent);
+        m.fail("нет устройства".into());
+        assert_eq!(m.status(), SourceStatus::Failed("нет устройства".into()));
+        // Новая попытка открыть источник стирает старый отказ.
+        m.activate();
+        assert_eq!(m.status(), SourceStatus::NoData);
+    }
+
+    #[test]
+    fn errors_are_attributed_to_their_source_bin() {
+        gstreamer::init().unwrap();
+        use gstreamer::prelude::*;
+        let p = gstreamer::parse::launch(
+            "bin.( name=src_mic audiotestsrc name=inner ! identity ) ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gstreamer::Bin>()
+        .unwrap();
+        let inner = p.by_name("inner").unwrap();
+        assert_eq!(
+            AudioSource::owning(inner.upcast_ref()),
+            Some(AudioSource::Mic)
+        );
+        let sink = p.iterate_sinks().next().unwrap().unwrap();
+        assert_eq!(AudioSource::owning(sink.upcast_ref()), None);
+        assert_eq!(
+            AudioSource::from_element_name("level_sys"),
+            Some(AudioSource::System)
+        );
     }
 
     #[test]
