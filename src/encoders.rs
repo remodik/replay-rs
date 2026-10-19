@@ -903,6 +903,14 @@ mod tests {
 
     const OK: ProbeOutcome = ProbeOutcome::Works { millis: 1 };
 
+    /// Автовыбор явно: на Windows по умолчанию x264enc.
+    fn auto() -> Config {
+        Config {
+            encoder: Encoder::Auto,
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn va_names_are_parsed_including_device_specific() {
         let s = va_spec("vah264enc").unwrap();
@@ -928,7 +936,7 @@ mod tests {
             ("vah264enc", OK),
             ("x265enc", OK),
         ]);
-        let cfg = Config::default();
+        let cfg = auto();
         let sel = select(&cfg, &d, &[]);
         let names: Vec<&str> = sel.order.iter().map(|s| s.element.as_str()).collect();
         assert_eq!(
@@ -951,7 +959,7 @@ mod tests {
             ("openh264enc", OK),
             ("x264enc", ProbeOutcome::PluginMissing),
         ]);
-        let sel = select(&Config::default(), &d, &[]);
+        let sel = select(&auto(), &d, &[]);
         let names: Vec<&str> = sel.order.iter().map(|s| s.element.as_str()).collect();
         assert_eq!(names, ["openh264enc"]);
     }
@@ -1000,7 +1008,7 @@ mod tests {
     fn runtime_rejection_moves_to_next_candidate() {
         let d = found(&[("vah264enc", OK), ("openh264enc", OK)]);
         let rejected = vec![("vah264enc".to_owned(), "GPU hang".to_owned())];
-        let sel = select(&Config::default(), &d, &rejected);
+        let sel = select(&auto(), &d, &rejected);
         assert_eq!(sel.order.len(), 1);
         assert_eq!(sel.order[0].element, "openh264enc");
         assert!(sel.note.unwrap().contains("GPU hang"));
@@ -1030,7 +1038,7 @@ mod tests {
         let d = found(&[("vah264enc", OK), ("x265enc", OK)]);
         let cfg = Config {
             video_codec: VideoCodec::H265,
-            ..Config::default()
+            ..auto()
         };
         let sel = select(&cfg, &d, &[]);
         let names: Vec<&str> = sel.order.iter().map(|s| s.element.as_str()).collect();

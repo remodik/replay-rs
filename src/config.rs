@@ -11,6 +11,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Encoder {
     /// Лучший из реально работающих на этой машине (`encoders::select`).
+    /// По умолчанию на Linux; на Windows по умолчанию — `x264enc`.
     #[default]
     Auto,
     /// Конкретный элемент, выбранный вручную.
@@ -317,7 +318,14 @@ impl Default for Config {
             gop: 1.0,
             max_mb: 300,
             output: dirs_videos().join("replays"),
-            encoder: Encoder::Auto,
+            // На Windows аппаратные кодировщики не проверены на оборудовании:
+            // по умолчанию — проверенный программный x264enc, автовыбор и
+            // аппаратные доступны в окне вручную.
+            encoder: if cfg!(windows) {
+                Encoder::Element("x264enc".into())
+            } else {
+                Encoder::Auto
+            },
             video_codec: crate::encoders::VideoCodec::H264,
             monitor: -1,
             width: 1920,
@@ -670,8 +678,15 @@ mod portability_tests {
     }
 
     #[test]
-    fn default_encoder_is_auto() {
-        assert_eq!(Config::default().encoder, Encoder::Auto);
+    fn default_encoder_matches_platform() {
+        assert_eq!(
+            Config::default().encoder,
+            if cfg!(windows) {
+                Encoder::Element("x264enc".into())
+            } else {
+                Encoder::Auto
+            }
+        );
     }
 
     /// Ручной выбор прошлых версий остаётся ручным выбором того же элемента.

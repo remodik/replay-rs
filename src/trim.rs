@@ -166,7 +166,10 @@ pub fn trim(req: &TrimRequest, progress: &Arc<Progress>) -> Result<TrimOutcome> 
             let codec = video_codec(&video.media).context("неизвестный видеокодек")?;
             let spec = match &req.encoder {
                 Some(s) if s.codec == codec => Some(s.clone()),
+                // Автовыбор под кодек исходника явно: значение по умолчанию
+                // на Windows — x264enc, то есть H.264 при любом исходнике.
                 _ => crate::encoders::resolve_quick(&Config {
+                    encoder: crate::config::Encoder::Auto,
                     video_codec: codec,
                     ..Config::default()
                 }),
