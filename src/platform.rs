@@ -11,18 +11,26 @@ pub fn windows_source(monitor: i32) -> String {
 /// Путь задаём свойством GObject, а не подставляем в описание конвейера.
 /// Так работают и буквы дисков Windows, и обратные слеши, и пробелы в именах.
 pub fn set_file_location(pipeline: &gstreamer::Pipeline, name: &str, path: &Path) -> Result<()> {
+    let element = pipeline
+        .by_name(name)
+        .context("в конвейере нет файлового элемента")?;
+    set_location(&element, path)
+}
+
+/// То же для отдельного элемента (filesrc/filesink).
+pub fn set_location(element: &gstreamer::Element, path: &Path) -> Result<()> {
     let location = path.to_str().context("путь к файлу не в UTF-8")?;
     anyhow::ensure!(!location.contains('\0'), "путь содержит NUL");
-    pipeline
-        .by_name(name)
-        .context("в конвейере нет файлового элемента")?
-        .set_property("location", location);
+    element.set_property("location", location);
     Ok(())
 }
 
 pub fn open_path(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open").arg(path).spawn()?;
+    {
+        let child = std::process::Command::new("xdg-open").arg(path).spawn()?;
+        reap(child);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -47,6 +55,32 @@ pub fn open_path(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `open_path` для кнопок «открыть»: результата ждать некому, но отказ
+/// хотя бы попадает в лог, а не пропадает.
+pub fn open_or_warn(path: &Path) {
+    if let Err(e) = open_path(path) {
+        log::warn!("не удалось открыть {}: {e:#}", path.display());
+    }
+}
+
+/// Дожидается дочернего процесса в фоне.
+///
+/// Брошенный `Child` никто не ждёт, и каждый открытый клип оставлял зомби
+/// до выхода рекордера, а он работает сутками.
+#[cfg(target_os = "linux")]
+pub fn reap(mut child: std::process::Child) {
+    let spawned = std::thread::Builder::new()
+        .name("reap".into())
+        .spawn(move || {
+            if let Err(e) = child.wait() {
+                log::debug!("не удалось дождаться дочернего процесса: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        log::debug!("не удалось запустить поток ожидания: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +120,7 @@ pub fn file_uri(path: &Path) -> String {
         format!("file://{}", path.display())
     }
 }
+
 fn windows_file_uri(path: &str) -> String {
     let path = path.replace('\\', "/");
     if path.starts_with("//") {
