@@ -434,6 +434,17 @@ fn current_codec(cfg: &crate::config::Config) -> Option<audio::AudioCodec> {
 /// Строит и крутит конвейер до команды или ошибки.
 /// Возвращает команду, которая его остановила.
 fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
+    // Свой контекст glib на каждую сборку, назначенный контекстом потока по
+    // умолчанию: к нему цепляются наблюдатель шины и таймер опроса. С
+    // глобальным контекстом два потока захвата в одном процессе (тесты идут
+    // параллельно) делили его, и обработчик шины вызывался из чужого потока —
+    // glib паниковал «Value accessed from different thread».
+    let ctx = gst::glib::MainContext::new();
+    ctx.with_thread_default(|| run_in_context(a, &ctx))
+        .map_err(|e| anyhow::anyhow!("не удалось занять контекст glib: {e}"))?
+}
+
+fn run_in_context(a: &Attempt<'_>, ctx: &gst::glib::MainContext) -> Result<Option<Command>> {
     let Attempt {
         rec,
         cfg,
@@ -469,7 +480,8 @@ fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
         pipeline::attach_audio_sinks(&gst_pipeline, &tracks)?;
     }
 
-    let main_loop = gst::glib::MainLoop::new(None, false);
+    // Флаг «пора выходить» вместо MainLoop::quit: цикл крутим сами (ниже).
+    let stop = Rc::new(std::cell::Cell::new(false));
     let pending: Rc<RefCell<Option<Command>>> = Rc::new(RefCell::new(None));
     let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let encoder_failure: Rc<RefCell<Option<EncoderFailed>>> = Rc::new(RefCell::new(None));
@@ -479,7 +491,7 @@ fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
 
     let bus = gst_pipeline.bus().context("у конвейера нет шины")?;
     let _guard = {
-        let l = main_loop.clone();
+        let l = stop.clone();
         let failure = failure.clone();
         let encoder_failure = encoder_failure.clone();
         let element = encoder.element.clone();
@@ -498,7 +510,7 @@ fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
             }
             if let Some(f) = encoder_error(msg, &element) {
                 *encoder_failure.borrow_mut() = Some(f);
-                l.quit();
+                l.set(true);
                 return gst::glib::ControlFlow::Continue;
             }
             if let Some((source, peak)) = pipeline::level_peak(msg) {
@@ -514,7 +526,7 @@ fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
                 // Тогда — пересборка без источника, как при отказе на старте.
                 if !playing.get() {
                     early_source.borrow_mut().get_or_insert(f);
-                    l.quit();
+                    l.set(true);
                     return gst::glib::ControlFlow::Continue;
                 }
                 log::warn!("{f} — дорожка продолжится тишиной");
@@ -524,11 +536,11 @@ fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
             match msg.view() {
                 gst::MessageView::Error(e) => {
                     *failure.borrow_mut() = Some(format!("{} ({:?})", e.error(), e.debug()));
-                    l.quit();
+                    l.set(true);
                 }
                 gst::MessageView::Eos(_) => {
                     *failure.borrow_mut() = Some("поток неожиданно закончился".into());
-                    l.quit();
+                    l.set(true);
                 }
                 _ => {}
             }
@@ -537,35 +549,36 @@ fn run_once(a: &Attempt<'_>) -> Result<Option<Command>> {
         .context("не удалось подписаться на шину")?
     };
 
-    let poll = {
-        let l = main_loop.clone();
-        let rx = rx.clone();
-        let pending = pending.clone();
-        gst::glib::timeout_add_local(Duration::from_millis(100), move || {
-            if pending.borrow().is_none() {
-                match rx.try_recv() {
-                    Err(TryRecvError::Empty) => {}
-                    Ok(cmd) => {
-                        *pending.borrow_mut() = Some(cmd);
-                        l.quit();
-                    }
-                    // GUI уронили — останавливаемся.
-                    Err(TryRecvError::Disconnected) => {
-                        *pending.borrow_mut() = Some(Command::Stop);
-                        l.quit();
-                    }
-                }
-            }
-            gst::glib::ControlFlow::Continue
-        })
-    };
+    // Пробуждение раз в 100 мс — чтобы проверить канал команд. Источник
+    // прикреплён к нашему контексту: `timeout_add_local` всегда берёт
+    // глобальный, и с ним команды до потока не доходили бы.
+    let tick = gst::glib::timeout_source_new(
+        Duration::from_millis(100),
+        None,
+        gst::glib::Priority::DEFAULT,
+        || gst::glib::ControlFlow::Continue,
+    );
+    tick.attach(Some(ctx));
 
     let started = gst_pipeline.set_state(gst::State::Playing);
     if started.is_ok() {
         *state.lock().expect("состояние захвата отравлено") = CaptureState::Running;
-        main_loop.run();
+        while !stop.get() {
+            ctx.iteration(true);
+            if pending.borrow().is_none() {
+                match rx.try_recv() {
+                    Err(TryRecvError::Empty) => {}
+                    Ok(cmd) => *pending.borrow_mut() = Some(cmd),
+                    // GUI уронили — останавливаемся.
+                    Err(TryRecvError::Disconnected) => *pending.borrow_mut() = Some(Command::Stop),
+                }
+            }
+            if pending.borrow().is_some() {
+                break;
+            }
+        }
     }
-    poll.remove();
+    tick.destroy();
     // Причину неудачного запуска читаем до NULL: переход в NULL сбрасывает
     // шину вместе с сообщениями об ошибках.
     let mut failed_source = early_source.borrow_mut().take();
