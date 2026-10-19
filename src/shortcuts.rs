@@ -67,7 +67,10 @@ impl Shortcuts {
     /// регистрирует хоткей в настройках KDE.
     pub(crate) fn inert(state: ShortcutState) -> Self {
         let (tx, _rx) = mpsc::channel();
-        Self { tx, state: Arc::new(Mutex::new(state)) }
+        Self {
+            tx,
+            state: Arc::new(Mutex::new(state)),
+        }
     }
 }
 
@@ -89,7 +92,10 @@ impl Shortcuts {
     }
 
     pub fn state(&self) -> ShortcutState {
-        self.state.lock().expect("состояние хоткея отравлено").clone()
+        self.state
+            .lock()
+            .expect("состояние хоткея отравлено")
+            .clone()
     }
 
     /// Просит портал открыть системный редактор комбинаций для наших действий.
@@ -220,13 +226,19 @@ mod tests {
     #[test]
     fn summary_distinguishes_unbound_from_unavailable() {
         // «Не назначена» и «портала нет» — разные беды с разным лечением.
-        let unbound = ShortcutState { registered: true, ..Default::default() };
+        let unbound = ShortcutState {
+            registered: true,
+            ..Default::default()
+        };
         assert_eq!(unbound.summary(), "не назначена");
 
         let pending = ShortcutState::default();
         assert_eq!(pending.summary(), "регистрируется…");
 
-        let broken = ShortcutState { error: Some("нет портала".into()), ..Default::default() };
+        let broken = ShortcutState {
+            error: Some("нет портала".into()),
+            ..Default::default()
+        };
         assert!(broken.summary().contains("нет портала"));
 
         let ok = ShortcutState {
