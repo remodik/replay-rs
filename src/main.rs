@@ -45,9 +45,17 @@ struct Args {
     #[arg(long)]
     quit: bool,
 
+    /// Проверить кодировщики видео, напечатать таблицу и выйти
+    #[arg(long)]
+    list_encoders: bool,
+
     // Ниже — разовые переопределения сохранённых настроек.
+    /// auto — лучший работающий; иначе имя элемента GStreamer (vah264enc, x264enc…)
     #[arg(long)]
     encoder: Option<String>,
+    /// Видеокодек для автовыбора: h264, h265; av1 — экспериментально
+    #[arg(long)]
+    video_codec: Option<String>,
     /// Windows: индекс монитора DXGI, -1 — основной монитор
     #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     monitor: Option<i32>,
@@ -80,6 +88,9 @@ struct Args {
 #[cfg(target_os = "linux")]
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+#[cfg(target_os = "linux")]
+const SAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Будим работающий процесс сигналом.
 ///
 /// SIGUSR1 — сохранить клип (запасной вариант хоткея), SIGUSR2 — открыть
@@ -88,9 +99,14 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500
 /// Уведомление на рабочий стол. Необязательное: нет notify-send — не беда.
 #[cfg(target_os = "linux")]
 fn notify(summary: &str, body: &str) {
-    let _ = std::process::Command::new("notify-send")
+    match std::process::Command::new("notify-send")
         .args(["--app-name=replay-rs", "--icon=media-record", summary, body])
-        .spawn();
+        .spawn()
+    {
+        // Ждём в фоне: иначе каждое уведомление оставляло бы зомби.
+        Ok(child) => replay_rs::platform::reap(child),
+        Err(e) => log::debug!("notify-send недоступен: {e}"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -113,6 +129,11 @@ fn build_config(args: &Args) -> Result<Config> {
     }
     if let Some(e) = &args.encoder {
         cfg.encoder = e.parse::<Encoder>().map_err(anyhow::Error::msg)?;
+    }
+    if let Some(c) = &args.video_codec {
+        cfg.video_codec = c
+            .parse::<replay_rs::encoders::VideoCodec>()
+            .map_err(anyhow::Error::msg)?;
     }
     if let Some(v) = args.seconds {
         cfg.seconds = v;
@@ -174,6 +195,13 @@ fn main() -> Result<()> {
         return signal_running(libc::SIGTERM, "остановка");
     }
 
+    if args.list_encoders {
+        gst::init().context("не удалось инициализировать GStreamer")?;
+        let found = replay_rs::encoders::discover(&replay_rs::encoders::VideoCodec::ALL);
+        print!("{}", replay_rs::encoders::report(&found));
+        return Ok(());
+    }
+
     let mode = match args.mode.as_str() {
         #[cfg(target_os = "linux")]
         "auto" | "portal" => Mode::Portal,
@@ -204,6 +232,9 @@ fn main() -> Result<()> {
     };
 
     let cfg = build_config(&args)?;
+    // Замок уже наш, так что *.mp4.part в папке — огрызки прошлого запуска,
+    // а не чужая запись.
+    replay_rs::saver::remove_stale_parts(&cfg.output);
     #[cfg(windows)]
     anyhow::ensure!(
         !cfg.encoder.is_va(),
@@ -212,22 +243,13 @@ fn main() -> Result<()> {
     gst::init().context("не удалось инициализировать GStreamer")?;
 
     // Кодек выбираем после gst::init(): без неё реестр элементов недоступен.
-    let codec = if cfg.audio.any_enabled() {
-        let choice = audio::choose_codec(cfg.audio.codec);
-        match choice {
-            audio::CodecChoice::Exact(c) => log::info!("звук: {}", c.as_str()),
-            audio::CodecChoice::FellBack(c) => log::warn!(
-                "запрошен AAC, но avenc_aac недоступен (нужен плагин libav) — пишу в {}",
-                c.as_str()
-            ),
-            audio::CodecChoice::None => log::warn!(
-                "звук включён, но нет ни avenc_aac (нужен плагин libav), ни opusenc — пишу без звука"
-            ),
-        }
-        choice.codec()
-    } else {
-        None
-    };
+    // Поток захвата перевыбирает его при каждой сборке конвейера и пишет в
+    // лог, что получилось; здесь — только начальное значение для окна.
+    let codec = cfg
+        .audio
+        .any_enabled()
+        .then(|| audio::choose_codec(cfg.audio.codec).codec())
+        .flatten();
     let rec = Arc::new(Recorder::new(cfg, codec));
     let service = Arc::new(CaptureService::start(rec.clone(), mode));
 
@@ -235,6 +257,28 @@ fn main() -> Result<()> {
         "replay-rs запущен (pid {}). Сохранить: replay-rs --save",
         std::process::id()
     );
+
+    // Уведомление после сохранения — по настройке, проверяемой в момент
+    // сохранения. Weak: подписка живёт в самом Recorder.
+    let weak = Arc::downgrade(&rec);
+    rec.on_saved(move |r| {
+        let Some(rec) = weak.upgrade() else { return };
+        if !rec.config().overlay.notify_on_save {
+            return;
+        }
+        match &r.result {
+            Ok(p) => notify(
+                "Клип сохранён",
+                &p.file_name().unwrap_or_default().to_string_lossy(),
+            ),
+            Err(e) => notify("Клип не сохранён", e),
+        }
+    });
+    // Оверлей сам следит за настройками: выключенный — спит.
+    let overlay = Arc::new(replay_rs::overlay::Overlay::spawn(
+        rec.clone(),
+        service.clone(),
+    ));
 
     let shortcuts = Arc::new(shortcuts::Shortcuts::spawn(rec.clone()));
     #[cfg(target_os = "linux")]
@@ -267,7 +311,12 @@ fn main() -> Result<()> {
     let result = if args.headless {
         run_headless(&shortcuts)
     } else {
-        run_gui(rec.clone(), service.clone(), shortcuts.clone())
+        run_gui(
+            rec.clone(),
+            service.clone(),
+            shortcuts.clone(),
+            overlay.clone(),
+        )
     };
 
     service.request_stop();
@@ -299,6 +348,7 @@ fn run_gui(
     rec: Arc<Recorder>,
     service: Arc<CaptureService>,
     shortcuts: Arc<shortcuts::Shortcuts>,
+    overlay: Arc<replay_rs::overlay::Overlay>,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     let background_shortcuts = shortcuts.clone();
@@ -322,7 +372,7 @@ fn run_gui(
         options,
         Box::new(move |cc| {
             Ok(Box::new(replay_rs::gui::App::new(
-                cc, rec, service, shortcuts,
+                cc, rec, service, shortcuts, overlay,
             )))
         }),
     )
@@ -372,6 +422,13 @@ fn install_signal_handlers(
                         // Даём конвейеру дойти до NULL: иначе VA-кодировщик
                         // падает с «Failed to encode the frame» посреди кадра.
                         service.request_stop();
+                        let deadline = std::time::Instant::now() + SAVE_GRACE;
+                        while rec.is_saving() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        if rec.is_saving() {
+                            log::warn!("сохранение не успело завершиться до выхода");
+                        }
                         std::thread::sleep(SHUTDOWN_GRACE);
                         let _ = std::fs::remove_file(instance::pidfile());
                         std::process::exit(0);
