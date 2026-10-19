@@ -129,8 +129,7 @@ pub fn save_token(token: &str) -> Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("не удалось создать {}", dir.display()))?;
     }
-    std::fs::write(&path, token)
-        .with_context(|| format!("не удалось записать {}", path.display()))
+    std::fs::write(&path, token).with_context(|| format!("не удалось записать {}", path.display()))
 }
 
 /// Токен протух (экран отключили, разрешение отозвали) — забываем его,
